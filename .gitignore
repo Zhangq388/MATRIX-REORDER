@@ -1,0 +1,32 @@
+# Build files
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.o
+*.out
+*.so
+*.a
+*.exe
+
+# Logs
+*.log
+log.txt
+
+# Debug / temporary files
+dbg/
+*.tmp
+*.bak
+*.swp
+
+# Large or generated results
+result/
+*.csv
+*.bin
+*.mtx
+
+# System files
+.DS_Store
+.vscode/
+.idea/

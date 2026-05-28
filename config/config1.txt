@@ -1,0 +1,8 @@
+1 /data3/graph/test/Tina_AskCal.mtx 11 11 29
+2 /data3/graph/mtx/mycielskian5.mtx 23 23 142
+3 /data3/graph/mtx/Stranke94.mtx 10 10 90
+4 /data3/graph/test/gre_512.mtx 512 512 2188
+5 /data3/graph/mtx/wb-cs-stanford.mtx 9914 9914 36854
+6 /data3/graph/mtx/ut2010.mtx 115406 115406 572066
+7 /data3/graph/mtx/email-EuAll.mtx 1 1 1
+8 /data3/graph/mtx/soc-Epinions1.mtx 1 1 1
