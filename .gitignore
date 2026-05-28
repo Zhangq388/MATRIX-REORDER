@@ -1,5 +1,24 @@
 # Build files
 build/
+*/build/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.o
+*.a
+*.out
+*.exe
+
+# Logs and temporary files
+*.log
+log.txt
+dbg/
+result/
+.vscode/
+.idea/
+.DS_Store# Build files
+build/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

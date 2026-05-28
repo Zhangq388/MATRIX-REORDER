@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 18
+  },
+  "configurePresets": [
+    {
+      "name": "release-g++11",
+      "displayName": "Release build with g++-11",
+      "description": "Use g++-11 and Release mode",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++-11"
+      }
+    }
+  ]
+}
+
+  
