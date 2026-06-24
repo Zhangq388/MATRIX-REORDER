@@ -4,6 +4,7 @@
 #include "timer.cuh"
 #include "ThreadPool.h"
 #include "integer_heap.cuh"
+#include "model.cuh"
 #include "SlashBurn.h"
 #include "rcm.h"
 #include "rabbit_order.h"
@@ -79,10 +80,7 @@ struct GRAPH
     void show(); //打印矩阵
     void visual(std::string _filename);
     int  gscore(const ENV& _env, const int _width);
-    void row_length_stats(int window);
-    void jaccard(const ENV& _env, int _id1, int _id2);
     void locality_predict(const ENV& _env, float& speedup);
-    void sampled_hll_rd_block_gpu(const ENV& _env, const int samples, const int sector_size, const int rd_cap, const int hll_p, const int max_scan, const int stream_type);
     void spmv(const ENV& _env, std::string _method); 
     void relabel_random();
     void relabel_degree();

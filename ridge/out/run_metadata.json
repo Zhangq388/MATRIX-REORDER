@@ -1,0 +1,60 @@
+{
+  "data_dir": "/home/ta/zhangq388/RELABEL/ridge/data",
+  "selected_kernels": [
+    "merbit",
+    "csr"
+  ],
+  "input_files": {
+    "merbit": {
+      "train": "/home/ta/zhangq388/RELABEL/ridge/data/train_merbit.csv",
+      "sparse": "/home/ta/zhangq388/RELABEL/ridge/data/test_sparse_merbit.csv",
+      "rmat": "/home/ta/zhangq388/RELABEL/ridge/data/test_rmat_merbit.csv"
+    },
+    "csr": {
+      "train": "/home/ta/zhangq388/RELABEL/ridge/data/train_csr.csv",
+      "sparse": "/home/ta/zhangq388/RELABEL/ridge/data/test_sparse_csr.csv",
+      "rmat": "/home/ta/zhangq388/RELABEL/ridge/data/test_rmat_csr.csv"
+    }
+  },
+  "out_dir": "/home/ta/zhangq388/RELABEL/ridge/out",
+  "ridge_alpha": 1.0,
+  "cv_folds": 5,
+  "feature_variants": [
+    "exact",
+    "sampled"
+  ],
+  "feature_count": 10,
+  "band_gate_pairs": [
+    [
+      0.99,
+      1.01
+    ],
+    [
+      0.98,
+      1.02
+    ],
+    [
+      0.97,
+      1.03
+    ],
+    [
+      0.96,
+      1.04
+    ],
+    [
+      0.95,
+      1.05
+    ],
+    [
+      0.94,
+      1.06
+    ],
+    [
+      0.93,
+      1.07
+    ]
+  ],
+  "expected_augmented_per_graph": 9,
+  "cross_kernel_feature_tolerance": 1e-12,
+  "random_seed_reserved": 20260616
+}

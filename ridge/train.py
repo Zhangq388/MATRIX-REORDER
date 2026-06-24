@@ -1,34 +1,55 @@
+#!/usr/bin/env python3
 """
-Evaluate the RD-based SpMV headroom predictor with two target kernels:
-  1) MERBIT SpMV speedup targets
-  2) CSR SpMV speedup targets
+Evaluate exact and sampled reuse-distance (RD) features for two SpMV backends:
+MERBIT and CSR.
 
-Input CSVs expected by default:
-  - train_merbit.csv            augmented local-swap SuiteSparse samples
-  - train_csr.csv               augmented local-swap SuiteSparse samples
-  - test_sparse_merbit.csv      original SuiteSparse samples
-  - test_sparse_csr.csv         original SuiteSparse samples
+Expected schema for every input CSV:
 
-Each CSV should contain:
-  graph_id, r1...r10, and either speedup or time.
+    graph_id,
+    exact_r1,...,exact_r10,exact_time_ms,
+    sampled_r1,...,sampled_r10,sampled_time_ms,
+    speedup
 
-Experiments:
-  A) GroupKFold on augmented samples only.
-  B) Train on all augmented samples and test on original samples from the same graph set.
-     This reproduces the old S2O setting, but it should be described as same-graph testing.
-  C) Leakage-free held-out graph test. For each fold, the model is trained only on
-     augmented samples from training graphs and tested on original samples from unseen graphs.
-     This is the recommended experiment for claiming generalization across real-world graphs.
+Default data layout:
 
-Outputs are written to ./predictor_eval_merbit_csr_outputs by default.
+    data/train_merbit.csv
+    data/test_sparse_merbit.csv
+    data/test_rmat_merbit.csv
+    data/train_csr.csv
+    data/test_sparse_csr.csv
+    data/test_rmat_csr.csv
+
+For each backend, the script trains and evaluates two independent Ridge models:
+
+    exact RD features   -> log(speedup)
+    sampled RD features -> log(speedup)
+
+The same graph folds are shared by both feature variants and both backends, so
+all exact-vs-sampled and MERBIT-vs-CSR comparisons are paired and leakage-free.
+The sampled-trained model is the intended deployment path; exact RD is retained
+as a scientific baseline.
+
+Main experiments per backend:
+    A. Grouped cross-validation on augmented SuiteSparse samples.
+    B. Train on all augmented samples and test original SuiteSparse graphs from
+       the same graph set (auxiliary same-graph result).
+    C. Leakage-free held-out SuiteSparse graph evaluation.
+    D. Train on all augmented samples and test external RMAT graphs.
+
+Additional outputs include feature-approximation statistics, extraction-time
+statistics, gate metrics, cross-feature diagnostics, backend-sensitivity
+comparisons, and deployable CSV/JSON/C++ model parameters for both backends.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,21 +57,37 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
 # =========================================================
-# Config
+# Configuration
 # =========================================================
 
+FEATURE_COUNT = 10
+FEATURE_VARIANTS: Tuple[str, ...] = ("exact", "sampled")
+SUPPORTED_KERNELS: Tuple[str, ...] = ("merbit", "csr")
+DEFAULT_DATA_FILES: Dict[str, Dict[str, str]] = {
+    "merbit": {
+        "train": "train_merbit.csv",
+        "sparse": "test_sparse_merbit.csv",
+        "rmat": "test_rmat_merbit.csv",
+    },
+    "csr": {
+        "train": "train_csr.csv",
+        "sparse": "test_sparse_csr.csv",
+        "rmat": "test_rmat_csr.csv",
+    },
+}
 RIDGE_ALPHA = 1.0
-EPS = 1e-12
 CV_FOLDS = 5
+EPS = 1e-12
+ROW_SUM_WARN_TOL = 1e-3
+RANDOM_SEED = 20260616
 
-# 三值门控阈值扫描。
 BAND_GATE_PAIRS: List[Tuple[float, float]] = [
     (0.99, 1.01),
     (0.98, 1.02),
@@ -61,255 +98,498 @@ BAND_GATE_PAIRS: List[Tuple[float, float]] = [
     (0.93, 1.07),
 ]
 
-DEFAULT_DATASETS = {
-    "merbit": {
-        "train_csv": "train_merbit.csv",
-        "test_csv": "test_sparse_merbit.csv",
-    },
-    "csr": {
-        "train_csv": "train_csr.csv",
-        "test_csv": "test_sparse_csr.csv",
-    },
-}
+
+# =========================================================
+# Data structures
+# =========================================================
+
+
+@dataclass(frozen=True)
+class GraphFold:
+    fold: int
+    train_graphs: Tuple[str, ...]
+    test_graphs: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class KernelBundle:
+    kernel: str
+    train: pd.DataFrame
+    sparse: pd.DataFrame
+    rmat: pd.DataFrame
+
+
+@dataclass
+class VariantResult:
+    kernel: str
+    variant: str
+    model_all_aug: Pipeline
+    feature_cols: List[str]
+    master_summary: pd.DataFrame
+    predictions: Dict[str, pd.DataFrame]
+    gate_tables: Dict[str, pd.DataFrame]
+    coefficient_table: pd.DataFrame
+
+
+@dataclass
+class KernelResult:
+    kernel: str
+    variants: Dict[str, VariantResult]
+    metric_comparison: pd.DataFrame
+    cross_feature_summary: pd.DataFrame
 
 
 # =========================================================
-# Utilities
+# General utilities
 # =========================================================
+
+
+def natural_graph_key(value: object) -> Tuple[object, ...]:
+    """Sort numeric graph IDs numerically and all other IDs lexically."""
+    text = str(value).strip()
+    try:
+        return (0, int(text))
+    except ValueError:
+        return (1, text)
 
 
 def spearman_corr(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_pred_arr = np.asarray(y_pred, dtype=float)
 
-    if len(y_true) < 2:
+    finite = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
+    y_true_arr = y_true_arr[finite]
+    y_pred_arr = y_pred_arr[finite]
+
+    if len(y_true_arr) < 2:
         return np.nan
 
-    y_true_rank = pd.Series(y_true).rank(method="average").to_numpy()
-    y_pred_rank = pd.Series(y_pred).rank(method="average").to_numpy()
+    y_true_rank = pd.Series(y_true_arr).rank(method="average").to_numpy()
+    y_pred_rank = pd.Series(y_pred_arr).rank(method="average").to_numpy()
 
     a = y_true_rank - y_true_rank.mean()
     b = y_pred_rank - y_pred_rank.mean()
-    den = np.sqrt(np.sum(a * a) * np.sum(b * b))
-    if den < 1e-15:
+    denominator = np.sqrt(np.sum(a * a) * np.sum(b * b))
+    if denominator < 1e-15:
         return np.nan
-    return float(np.sum(a * b) / den)
+    return float(np.sum(a * b) / denominator)
 
 
+def pearson_corr(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
+    a = np.asarray(y_true, dtype=float)
+    b = np.asarray(y_pred, dtype=float)
+    finite = np.isfinite(a) & np.isfinite(b)
+    a = a[finite]
+    b = b[finite]
+    if len(a) < 2 or np.std(a) < EPS or np.std(b) < EPS:
+        return np.nan
+    return float(np.corrcoef(a, b)[0, 1])
 
-def mape(y_true_speedup: Sequence[float], y_pred_speedup: Sequence[float], eps: float = EPS) -> float:
-    y_true_speedup = np.asarray(y_true_speedup, dtype=float)
-    y_pred_speedup = np.asarray(y_pred_speedup, dtype=float)
-    denom = np.maximum(np.abs(y_true_speedup), eps)
-    return float(np.mean(np.abs(y_pred_speedup - y_true_speedup) / denom))
+
+def mape(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
+    true_arr = np.asarray(y_true, dtype=float)
+    pred_arr = np.asarray(y_pred, dtype=float)
+    denominator = np.maximum(np.abs(true_arr), EPS)
+    return float(np.mean(np.abs(pred_arr - true_arr) / denominator))
 
 
+def symmetric_mape(y_true: Sequence[float], y_pred: Sequence[float]) -> float:
+    true_arr = np.asarray(y_true, dtype=float)
+    pred_arr = np.asarray(y_pred, dtype=float)
+    denominator = np.maximum(np.abs(true_arr) + np.abs(pred_arr), EPS)
+    return float(np.mean(2.0 * np.abs(pred_arr - true_arr) / denominator))
 
-def _is_number_like(x: str) -> bool:
+
+def _is_number_like(text: str) -> bool:
     try:
-        float(x)
+        float(text)
         return True
     except ValueError:
         return False
 
 
-
-def _is_int_like(x: str) -> bool:
-    return x.isdigit() or (x.startswith("-") and x[1:].isdigit())
-
+def _is_int_like(text: str) -> bool:
+    return text.isdigit() or (text.startswith("-") and text[1:].isdigit())
 
 
 def extract_base_graph_id_from_swap(graph_id: object) -> str:
     """
-    Extract the original graph identity from a local-swap sample ID.
+    Remove the final local-swap suffix while preserving underscores in graph names.
 
-    Supported examples:
-      1_0.1_64_256                 -> 1
-      belgium_osm_0.1_64_256       -> belgium_osm
-
-    The old implementation used split("_")[0], which is unsafe for matrix names
-    that already contain underscores. This version removes the trailing local-swap
-    parameters when they are detected.
+    Examples:
+        1_0.1_64_256           -> 1
+        belgium_osm_0.1_64_256 -> belgium_osm
     """
-    s = str(graph_id).strip()
-    parts = s.split("_")
+    text = str(graph_id).strip()
+    parts = text.split("_")
 
-    # Typical local-swap suffix: <base>_<ratio/window/etc>_<param2>_<param3>
-    # Example: graph_0.1_64_256. Keep this conservative to avoid damaging names.
-    if len(parts) >= 4 and _is_number_like(parts[-3]) and _is_int_like(parts[-2]) and _is_int_like(parts[-1]):
+    if (
+        len(parts) >= 4
+        and _is_number_like(parts[-3])
+        and _is_int_like(parts[-2])
+        and _is_int_like(parts[-1])
+    ):
         return "_".join(parts[:-3])
 
-    # Fallback for old numeric IDs such as 1_0.1_64_256 if suffix format changes.
     if len(parts) > 1 and _is_number_like(parts[1]):
         return parts[0]
 
-    return s
+    return text
 
 
-
-def extract_base_graph_id_generic(graph_id: object) -> str:
-    """For original SuiteSparse IDs, keep the whole graph_id."""
-    return str(graph_id).strip()
+def canonical_r_cols() -> List[str]:
+    return [f"r{i}" for i in range(1, FEATURE_COUNT + 1)]
 
 
+def source_r_cols(variant: str) -> List[str]:
+    if variant not in FEATURE_VARIANTS:
+        raise ValueError(f"Unknown feature variant: {variant}")
+    return [f"{variant}_r{i}" for i in range(1, FEATURE_COUNT + 1)]
 
-def detect_r_cols(df: pd.DataFrame) -> List[str]:
-    r_cols = [c for c in df.columns if c.startswith("r") and c[1:].isdigit()]
-    return sorted(r_cols, key=lambda x: int(x[1:]))
+
+def ensure_directory(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-
-def choose_target_column(df: pd.DataFrame, dataset_name: str) -> str:
-    """
-    The old script used a column named `time` as the speedup target.
-    The new MERBIT / CSR CSVs use `speedup`. Support both formats.
-    """
-    if "speedup" in df.columns:
-        return "speedup"
-    if "time" in df.columns:
-        return "time"
-    raise ValueError(
-        f"[{dataset_name}] CSV must contain either `speedup` or `time`. "
-        f"Actual columns: {list(df.columns)}"
-    )
+def write_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # =========================================================
-# Loading / Cleaning
+# Loading and validation
 # =========================================================
 
 
-def load_and_clean(csv_path: Path, dataset_name: str, base_graph_mode: str) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    base_graph_mode:
-      - swap:    graph_id=<base>_<swap_param1>_<swap_param2>_<swap_param3> -> base_graph=<base>
-      - generic: graph_id itself is the base graph ID
-    """
-    df = pd.read_csv(csv_path)
-    df.columns = [c.strip().lower() for c in df.columns]
+def required_dual_columns() -> List[str]:
+    return [
+        "graph_id",
+        *source_r_cols("exact"),
+        "exact_time_ms",
+        *source_r_cols("sampled"),
+        "sampled_time_ms",
+        "speedup",
+    ]
 
-    r_cols = detect_r_cols(df)
-    if not r_cols:
-        raise ValueError(f"[{dataset_name}] No RD feature columns r1...rK found.")
 
-    target_col = choose_target_column(df, dataset_name)
-    required_cols = ["graph_id", target_col] + r_cols
-    missing = [c for c in required_cols if c not in df.columns]
+def load_dual_feature_dataset(
+    path: Path,
+    dataset_name: str,
+    graph_mode: str,
+    kernel: str,
+) -> pd.DataFrame:
+    """
+    graph_mode:
+        swap   - augmented graph ID with local-swap suffix;
+        sparse - original SuiteSparse ID;
+        rmat   - external RMAT ID (prefixed internally to avoid ID collisions).
+    """
+    kernel = kernel.strip().lower()
+    if kernel not in SUPPORTED_KERNELS:
+        raise ValueError(f"Unsupported kernel: {kernel}")
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {kernel}/{dataset_name} file: {path}")
+
+    df = pd.read_csv(path)
+    df.columns = [str(column).strip().lower() for column in df.columns]
+
+    missing = [column for column in required_dual_columns() if column not in df.columns]
     if missing:
-        raise ValueError(f"[{dataset_name}] Missing columns: {missing}. Actual columns: {list(df.columns)}")
+        raise ValueError(
+            f"[{dataset_name}] missing columns: {missing}. "
+            f"Actual columns: {list(df.columns)}"
+        )
 
-    # If a method column is present, keep origin rows to match the old script behavior.
-    if "method" in df.columns:
-        before = len(df)
-        df = df[df["method"].astype(str).str.strip().str.lower() == "origin"].copy()
-        print(f"[{dataset_name}] filter method == origin: {before} -> {len(df)}")
-
-    for c in r_cols + [target_col]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=required_cols).copy()
-    df = df[df[target_col] > 0].copy()
-
+    df = df[required_dual_columns()].copy()
     df["graph_id"] = df["graph_id"].astype(str).str.strip()
-    if base_graph_mode == "swap":
+
+    numeric_columns = [
+        *source_r_cols("exact"),
+        "exact_time_ms",
+        *source_r_cols("sampled"),
+        "sampled_time_ms",
+        "speedup",
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    invalid_mask = df[numeric_columns].isna().any(axis=1)
+    if invalid_mask.any():
+        bad_ids = df.loc[invalid_mask, "graph_id"].head(10).tolist()
+        raise ValueError(
+            f"[{dataset_name}] found {int(invalid_mask.sum())} rows with missing or "
+            f"non-numeric values. Example graph IDs: {bad_ids}"
+        )
+
+    if df["graph_id"].duplicated().any():
+        duplicates = df.loc[df["graph_id"].duplicated(keep=False), "graph_id"].head(10).tolist()
+        raise ValueError(f"[{dataset_name}] duplicate graph_id values: {duplicates}")
+
+    if (df["speedup"] <= 0.0).any():
+        bad_ids = df.loc[df["speedup"] <= 0.0, "graph_id"].head(10).tolist()
+        raise ValueError(f"[{dataset_name}] non-positive speedup values at: {bad_ids}")
+
+    if (df[["exact_time_ms", "sampled_time_ms"]] <= 0.0).any().any():
+        bad_ids = df.loc[
+            (df["exact_time_ms"] <= 0.0) | (df["sampled_time_ms"] <= 0.0),
+            "graph_id",
+        ].head(10).tolist()
+        raise ValueError(f"[{dataset_name}] non-positive extraction times at: {bad_ids}")
+
+    if graph_mode == "swap":
         df["base_graph"] = df["graph_id"].apply(extract_base_graph_id_from_swap)
-    elif base_graph_mode == "generic":
-        df["base_graph"] = df["graph_id"].apply(extract_base_graph_id_generic)
+    elif graph_mode == "sparse":
+        df["base_graph"] = df["graph_id"].astype(str)
+    elif graph_mode == "rmat":
+        # RMAT IDs such as 1..75 are not the same entities as SuiteSparse IDs 1..75.
+        df["base_graph"] = "rmat_" + df["graph_id"].astype(str)
     else:
-        raise ValueError(f"Unknown base_graph_mode: {base_graph_mode}")
+        raise ValueError(f"Unknown graph_mode: {graph_mode}")
 
-    # Normalize the target column name for downstream code.
-    df["speedup"] = df[target_col].astype(float)
+    df["kernel"] = kernel
+    df["dataset"] = dataset_name
 
-    rsum = df[r_cols].sum(axis=1)
-    max_rsum_dev = float(np.max(np.abs(rsum - 1.0))) if len(df) else np.nan
+    for variant in FEATURE_VARIANTS:
+        cols = source_r_cols(variant)
+        values = df[cols].to_numpy(dtype=float)
 
-    print(f"\n[{dataset_name}]")
-    print(f"  source: {csv_path.name}")
-    print(f"  target column: {target_col} -> speedup")
+        if not np.isfinite(values).all():
+            raise ValueError(f"[{dataset_name}/{variant}] non-finite RD features found")
+        if (values < -EPS).any():
+            raise ValueError(f"[{dataset_name}/{variant}] negative RD probabilities found")
+
+        row_sums = values.sum(axis=1)
+        max_deviation = float(np.max(np.abs(row_sums - 1.0)))
+        if max_deviation > ROW_SUM_WARN_TOL:
+            print(
+                f"WARNING [{dataset_name}/{variant}] max |sum(r)-1| = "
+                f"{max_deviation:.6g} > {ROW_SUM_WARN_TOL:.6g}",
+                file=sys.stderr,
+            )
+
+    print(f"\n[{kernel}/{dataset_name}]")
+    print(f"  source: {path}")
     print(f"  rows: {len(df)}")
     print(f"  unique graph_id: {df['graph_id'].nunique()}")
     print(f"  unique base_graph: {df['base_graph'].nunique()}")
-    print(f"  r columns: {r_cols}")
-    print(f"  max |sum(r)-1| = {max_rsum_dev:.6g}")
-    print(df["speedup"].describe().to_string())
-
-    return df, r_cols
-
-
-
-def dataset_stats(df: pd.DataFrame, dataset_name: str, kernel: str) -> Dict[str, object]:
-    y = df["speedup"].to_numpy(dtype=float)
-    y_pos = y > 1.0
-    return {
-        "kernel": kernel,
-        "dataset": dataset_name,
-        "rows": int(len(df)),
-        "graph_ids": int(df["graph_id"].nunique()),
-        "base_graphs": int(df["base_graph"].nunique()),
-        "mean_speedup": float(np.mean(y)),
-        "median_speedup": float(np.median(y)),
-        "min_speedup": float(np.min(y)),
-        "max_speedup": float(np.max(y)),
-        "num_pos_gt1": int(np.sum(y_pos)),
-        "num_neg_le1": int(len(y_pos) - np.sum(y_pos)),
-        "pos_rate_gt1": float(np.mean(y_pos)),
-    }
-
-
-
-def check_group_counts(df: pd.DataFrame, dataset_name: str, out_dir: Path, expected_group_size: Optional[int] = None) -> pd.DataFrame:
-    cnt = df.groupby("base_graph").size().sort_values()
-    out = pd.DataFrame({
-        "dataset": dataset_name,
-        "base_graph": cnt.index.astype(str),
-        "num_samples": cnt.values,
-    })
-    out.to_csv(out_dir / f"{dataset_name}_group_counts.csv", index=False)
-
-    print(f"\n[{dataset_name}] group size statistics")
-    print(cnt.describe().to_string())
-    if expected_group_size is not None:
-        bad = cnt[cnt != expected_group_size]
-        print(f"[{dataset_name}] groups not equal to {expected_group_size}: {len(bad)}")
-        if len(bad) > 0:
-            print(bad.to_string())
-    return out
-
-
-
-def check_train_test_graph_overlap(train_df: pd.DataFrame, test_df: pd.DataFrame, kernel: str, out_dir: Path) -> pd.DataFrame:
-    train_graphs = set(train_df["base_graph"].astype(str))
-    test_graphs = set(test_df["base_graph"].astype(str))
-    common = sorted(train_graphs & test_graphs)
-    train_only = sorted(train_graphs - test_graphs)
-    test_only = sorted(test_graphs - train_graphs)
-
-    rows = []
-    for g in common:
-        rows.append({"kernel": kernel, "base_graph": g, "status": "common"})
-    for g in train_only:
-        rows.append({"kernel": kernel, "base_graph": g, "status": "train_only"})
-    for g in test_only:
-        rows.append({"kernel": kernel, "base_graph": g, "status": "test_only"})
-
-    out = pd.DataFrame(rows)
-    out.to_csv(out_dir / f"{kernel}_train_test_base_graph_overlap.csv", index=False)
-
-    print(f"\n[{kernel}] train/test base_graph overlap")
-    print(f"  common graphs: {len(common)}")
-    print(f"  train-only graphs: {len(train_only)}")
-    print(f"  test-only graphs: {len(test_only)}")
-
-    if len(common) == 0:
-        raise ValueError(
-            f"[{kernel}] No common base_graph IDs between augmented train CSV and original test CSV. "
-            "Please check graph_id naming or the base_graph extraction rule."
+    print(f"  speedup range: [{df['speedup'].min():.6g}, {df['speedup'].max():.6g}]")
+    for variant in FEATURE_VARIANTS:
+        row_sums = df[source_r_cols(variant)].sum(axis=1)
+        print(
+            f"  {variant}: max |sum(r)-1|={np.max(np.abs(row_sums - 1.0)):.6g}, "
+            f"median time={df[f'{variant}_time_ms'].median():.6g} ms"
         )
+
+    return df
+
+
+def make_feature_view(df: pd.DataFrame, variant: str) -> pd.DataFrame:
+    """Create a canonical r1...r10 view from exact_* or sampled_* columns."""
+    src_cols = source_r_cols(variant)
+    rename_map = {src: dst for src, dst in zip(src_cols, canonical_r_cols())}
+
+    out = df[
+        [
+            "graph_id",
+            "base_graph",
+            "kernel",
+            "dataset",
+            "speedup",
+            "exact_time_ms",
+            "sampled_time_ms",
+            *src_cols,
+        ]
+    ].copy()
+    out = out.rename(columns=rename_map)
+    out["feature_variant"] = variant
     return out
+
+
+def dataset_summary(df: pd.DataFrame) -> pd.DataFrame:
+    y = df["speedup"].to_numpy(dtype=float)
+    rows: List[Dict[str, object]] = []
+
+    for variant in FEATURE_VARIANTS:
+        feature_values = df[source_r_cols(variant)].to_numpy(dtype=float)
+        row_sum_deviation = np.abs(feature_values.sum(axis=1) - 1.0)
+        time_values = df[f"{variant}_time_ms"].to_numpy(dtype=float)
+        rows.append(
+            {
+                "kernel": str(df["kernel"].iloc[0]),
+                "dataset": str(df["dataset"].iloc[0]),
+                "feature_variant": variant,
+                "rows": int(len(df)),
+                "graph_ids": int(df["graph_id"].nunique()),
+                "base_graphs": int(df["base_graph"].nunique()),
+                "mean_speedup": float(np.mean(y)),
+                "median_speedup": float(np.median(y)),
+                "min_speedup": float(np.min(y)),
+                "max_speedup": float(np.max(y)),
+                "num_speedup_gt1": int(np.sum(y > 1.0)),
+                "max_abs_feature_sum_deviation": float(np.max(row_sum_deviation)),
+                "mean_extraction_time_ms": float(np.mean(time_values)),
+                "median_extraction_time_ms": float(np.median(time_values)),
+                "p90_extraction_time_ms": float(np.quantile(time_values, 0.90)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def validate_group_structure(
+    train_df: pd.DataFrame,
+    sparse_df: pd.DataFrame,
+    expected_augmented_per_graph: Optional[int],
+    out_dir: Path,
+) -> None:
+    train_counts = train_df.groupby("base_graph", sort=True).size()
+    sparse_counts = sparse_df.groupby("base_graph", sort=True).size()
+
+    pd.DataFrame(
+        {"base_graph": train_counts.index, "num_augmented_samples": train_counts.values}
+    ).to_csv(out_dir / "train_group_counts.csv", index=False)
+    pd.DataFrame(
+        {"base_graph": sparse_counts.index, "num_original_samples": sparse_counts.values}
+    ).to_csv(out_dir / "sparse_test_group_counts.csv", index=False)
+
+    if expected_augmented_per_graph is not None:
+        bad = train_counts[train_counts != expected_augmented_per_graph]
+        if len(bad) > 0:
+            raise ValueError(
+                f"Expected {expected_augmented_per_graph} augmented samples per base graph, "
+                f"but {len(bad)} groups differ.\n{bad.to_string()}"
+            )
+
+    train_graphs = set(train_df["base_graph"].astype(str))
+    sparse_graphs = set(sparse_df["base_graph"].astype(str))
+    common = sorted(train_graphs & sparse_graphs, key=natural_graph_key)
+    train_only = sorted(train_graphs - sparse_graphs, key=natural_graph_key)
+    sparse_only = sorted(sparse_graphs - train_graphs, key=natural_graph_key)
+
+    overlap_rows = [
+        *({"base_graph": graph, "status": "common"} for graph in common),
+        *({"base_graph": graph, "status": "train_only"} for graph in train_only),
+        *({"base_graph": graph, "status": "sparse_only"} for graph in sparse_only),
+    ]
+    pd.DataFrame(overlap_rows).to_csv(out_dir / "train_sparse_graph_overlap.csv", index=False)
+
+    if not common:
+        raise ValueError("No common base graphs between augmented train and sparse original test")
+
+    print("\n[graph structure]")
+    print(f"  common SuiteSparse graphs: {len(common)}")
+    print(f"  train-only graphs: {len(train_only)}")
+    print(f"  sparse-only graphs: {len(sparse_only)}")
 
 
 # =========================================================
-# Model
+# Exact-vs-sampled feature analysis
+# =========================================================
+
+
+def analyze_feature_approximation(df: pd.DataFrame, out_dir: Path) -> Dict[str, pd.DataFrame]:
+    kernel = str(df["kernel"].iloc[0])
+    dataset_name = str(df["dataset"].iloc[0])
+    exact = df[source_r_cols("exact")].to_numpy(dtype=float)
+    sampled = df[source_r_cols("sampled")].to_numpy(dtype=float)
+    difference = sampled - exact
+    absolute_difference = np.abs(difference)
+
+    l1 = np.sum(absolute_difference, axis=1)
+    tv = 0.5 * l1
+    l2 = np.sqrt(np.sum(difference * difference, axis=1))
+    cosine_denominator = np.linalg.norm(exact, axis=1) * np.linalg.norm(sampled, axis=1)
+    cosine = np.divide(
+        np.sum(exact * sampled, axis=1),
+        cosine_denominator,
+        out=np.full(len(df), np.nan),
+        where=cosine_denominator > EPS,
+    )
+
+    exact_time = df["exact_time_ms"].to_numpy(dtype=float)
+    sampled_time = df["sampled_time_ms"].to_numpy(dtype=float)
+    time_speedup = exact_time / sampled_time
+
+    per_row = pd.DataFrame(
+        {
+            "kernel": kernel,
+            "dataset": dataset_name,
+            "graph_id": df["graph_id"].astype(str).to_numpy(),
+            "base_graph": df["base_graph"].astype(str).to_numpy(),
+            "feature_l1": l1,
+            "total_variation": tv,
+            "feature_l2": l2,
+            "cosine_similarity": cosine,
+            "max_abs_bin_error": np.max(absolute_difference, axis=1),
+            "exact_time_ms": exact_time,
+            "sampled_time_ms": sampled_time,
+            "extraction_speedup_exact_over_sampled": time_speedup,
+        }
+    )
+    for index in range(FEATURE_COUNT):
+        per_row[f"exact_r{index + 1}"] = exact[:, index]
+        per_row[f"sampled_r{index + 1}"] = sampled[:, index]
+        per_row[f"sample_minus_exact_r{index + 1}"] = difference[:, index]
+
+    per_row.to_csv(out_dir / f"{dataset_name}_feature_approximation_per_row.csv", index=False)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "kernel": kernel,
+                "dataset": dataset_name,
+                "rows": int(len(df)),
+                "mean_l1": float(np.mean(l1)),
+                "median_l1": float(np.median(l1)),
+                "p90_l1": float(np.quantile(l1, 0.90)),
+                "p95_l1": float(np.quantile(l1, 0.95)),
+                "max_l1": float(np.max(l1)),
+                "mean_total_variation": float(np.mean(tv)),
+                "mean_l2": float(np.mean(l2)),
+                "mean_cosine_similarity": float(np.nanmean(cosine)),
+                "mean_max_abs_bin_error": float(np.mean(np.max(absolute_difference, axis=1))),
+                "mean_exact_time_ms": float(np.mean(exact_time)),
+                "median_exact_time_ms": float(np.median(exact_time)),
+                "mean_sampled_time_ms": float(np.mean(sampled_time)),
+                "median_sampled_time_ms": float(np.median(sampled_time)),
+                "mean_extraction_speedup": float(np.mean(time_speedup)),
+                "geomean_extraction_speedup": float(np.exp(np.mean(np.log(time_speedup)))),
+                "median_extraction_speedup": float(np.median(time_speedup)),
+                "p10_extraction_speedup": float(np.quantile(time_speedup, 0.10)),
+                "p90_extraction_speedup": float(np.quantile(time_speedup, 0.90)),
+            }
+        ]
+    )
+    summary.to_csv(out_dir / f"{dataset_name}_feature_approximation_summary.csv", index=False)
+
+    bin_rows: List[Dict[str, object]] = []
+    for index in range(FEATURE_COUNT):
+        e = exact[:, index]
+        s = sampled[:, index]
+        d = s - e
+        bin_rows.append(
+            {
+                "kernel": kernel,
+                "dataset": dataset_name,
+                "feature": f"r{index + 1}",
+                "exact_mean": float(np.mean(e)),
+                "sampled_mean": float(np.mean(s)),
+                "bias_sample_minus_exact": float(np.mean(d)),
+                "mae": float(np.mean(np.abs(d))),
+                "rmse": float(np.sqrt(np.mean(d * d))),
+                "max_abs_error": float(np.max(np.abs(d))),
+                "pearson": pearson_corr(e, s),
+                "spearman": spearman_corr(e, s),
+            }
+        )
+    per_bin = pd.DataFrame(bin_rows)
+    per_bin.to_csv(out_dir / f"{dataset_name}_feature_approximation_per_bin.csv", index=False)
+
+    return {"summary": summary, "per_row": per_row, "per_bin": per_bin}
+
+
+# =========================================================
+# Model and deployment export
 # =========================================================
 
 
@@ -318,704 +598,1677 @@ def build_preprocess(r_cols: List[str]) -> ColumnTransformer:
         transformers=[
             (
                 "num",
-                Pipeline([
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("scaler", StandardScaler()),
-                ]),
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
                 r_cols,
-            ),
+            )
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+
+
+def make_pipeline(r_cols: List[str], ridge_alpha: float) -> Pipeline:
+    return Pipeline(
+        [
+            ("preprocess", build_preprocess(r_cols)),
+            ("model", Ridge(alpha=ridge_alpha)),
         ]
     )
 
 
+def extract_model_parameters(pipe: Pipeline, r_cols: List[str]) -> Dict[str, object]:
+    preprocess = pipe.named_steps["preprocess"]
+    ridge = pipe.named_steps["model"]
+    numeric_pipeline = preprocess.named_transformers_["num"]
+    imputer = numeric_pipeline.named_steps["imputer"]
+    scaler = numeric_pipeline.named_steps["scaler"]
 
-def make_pipe(r_cols: List[str]) -> Pipeline:
-    return Pipeline([
-        ("preprocess", build_preprocess(r_cols)),
-        ("model", Ridge(alpha=RIDGE_ALPHA)),
-    ])
+    imputer_median = np.asarray(imputer.statistics_, dtype=np.float64).reshape(-1)
+    scaler_mean = np.asarray(scaler.mean_, dtype=np.float64).reshape(-1)
+    scaler_scale = np.asarray(scaler.scale_, dtype=np.float64).reshape(-1)
+    coef_scaled = np.asarray(ridge.coef_, dtype=np.float64).reshape(-1)
+    intercept_scaled = float(np.asarray(ridge.intercept_, dtype=np.float64).reshape(()))
 
+    expected = len(r_cols)
+    for name, values in {
+        "imputer_median": imputer_median,
+        "scaler_mean": scaler_mean,
+        "scaler_scale": scaler_scale,
+        "coef_scaled": coef_scaled,
+    }.items():
+        if len(values) != expected:
+            raise ValueError(f"{name} length {len(values)} != feature count {expected}")
 
-# =========================================================
-# Evaluation
-# =========================================================
+    if np.any(~np.isfinite(scaler_scale)) or np.any(scaler_scale <= 0.0):
+        raise ValueError(f"Invalid StandardScaler scales: {scaler_scale}")
 
+    coef_raw = coef_scaled / scaler_scale
+    intercept_raw = intercept_scaled - float(
+        np.dot(coef_scaled, scaler_mean / scaler_scale)
+    )
 
-def eval_regression(y_true_log: Sequence[float], y_pred_log: Sequence[float]) -> Dict[str, float]:
-    y_true_s = np.exp(np.asarray(y_true_log, dtype=float))
-    y_pred_s = np.exp(np.asarray(y_pred_log, dtype=float))
     return {
-        "mae_log": float(mean_absolute_error(y_true_log, y_pred_log)),
-        "spearman": float(spearman_corr(y_true_log, y_pred_log)),
-        "mae_speedup": float(mean_absolute_error(y_true_s, y_pred_s)),
-        "mape": float(mape(y_true_s, y_pred_s, eps=EPS)),
+        "feature_order": list(r_cols),
+        "imputer_median": imputer_median,
+        "scaler_mean": scaler_mean,
+        "scaler_scale": scaler_scale,
+        "coef_scaled": coef_scaled,
+        "intercept_scaled": intercept_scaled,
+        "coef_raw": coef_raw,
+        "intercept_raw": intercept_raw,
+        "ridge_alpha": float(ridge.alpha),
     }
 
 
+def model_parameter_dataframe(
+    pipe: Pipeline,
+    r_cols: List[str],
+    variant: str,
+    kernel: str,
+) -> pd.DataFrame:
+    params = extract_model_parameters(pipe, r_cols)
+    out = pd.DataFrame(
+        {
+            "kernel": kernel,
+            "feature_variant": variant,
+            "feature": params["feature_order"],
+            "imputer_median": params["imputer_median"],
+            "scaler_mean": params["scaler_mean"],
+            "scaler_scale": params["scaler_scale"],
+            "ridge_coef_scaled": params["coef_scaled"],
+            "abs_ridge_coef_scaled": np.abs(params["coef_scaled"]),
+            "ridge_coef_raw": params["coef_raw"],
+            "abs_ridge_coef_raw": np.abs(params["coef_raw"]),
+        }
+    )
+    out["ridge_intercept_scaled"] = params["intercept_scaled"]
+    out["ridge_intercept_raw"] = params["intercept_raw"]
+    out["ridge_alpha"] = params["ridge_alpha"]
+    out["target"] = "log(speedup)"
+    return out
 
-def run_group_cv_once(train_df: pd.DataFrame, r_cols: List[str], cv_folds: int, save_prefix: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    X = train_df[r_cols].copy().reset_index(drop=True)
-    y_log = np.log(train_df["speedup"].to_numpy(dtype=float))
-    groups = train_df["base_graph"].reset_index(drop=True)
 
-    n_groups = groups.nunique()
-    if cv_folds > n_groups:
-        raise ValueError(f"cv_folds={cv_folds} > number of groups={n_groups}")
+def _cpp_array(values: Sequence[float], indent: str = "        ") -> str:
+    return (",\n" + indent).join(f"{float(value):.17e}" for value in values)
 
-    gkf = GroupKFold(n_splits=cv_folds)
-    oof_pred_log = np.zeros_like(y_log)
+
+def export_deployment_model(
+    pipe: Pipeline,
+    r_cols: List[str],
+    variant: str,
+    kernel: str,
+    out_dir: Path,
+    verification_frames: Mapping[str, pd.DataFrame],
+) -> Dict[str, Path]:
+    params = extract_model_parameters(pipe, r_cols)
+    prefix = f"{kernel}_{variant}_deploy_train_all_aug"
+
+    csv_path = out_dir / f"{prefix}_parameters.csv"
+    json_path = out_dir / f"{prefix}_model.json"
+    hpp_path = out_dir / f"rd_{variant}_{kernel}_model.hpp"
+    verification_path = out_dir / f"{prefix}_verification.csv"
+
+    model_parameter_dataframe(pipe, r_cols, variant, kernel).to_csv(csv_path, index=False)
+
+    payload = {
+        "kernel": kernel,
+        "feature_variant": variant,
+        "source_columns": source_r_cols(variant),
+        "canonical_feature_order": params["feature_order"],
+        "model_type": "Ridge",
+        "ridge_alpha": params["ridge_alpha"],
+        "training_target": "log(speedup)",
+        "inverse_transform": "exp(predicted_log_speedup)",
+        "preprocessing": {
+            "imputer_strategy": "median",
+            "imputer_statistics": [float(x) for x in params["imputer_median"]],
+            "standard_scaler_mean": [float(x) for x in params["scaler_mean"]],
+            "standard_scaler_scale": [float(x) for x in params["scaler_scale"]],
+        },
+        "ridge_standardized": {
+            "intercept": params["intercept_scaled"],
+            "coefficients": [float(x) for x in params["coef_scaled"]],
+        },
+        "ridge_raw_finite_features": {
+            "intercept": params["intercept_raw"],
+            "coefficients": [float(x) for x in params["coef_raw"]],
+            "formula": "speedup = exp(intercept + sum(coef[i] * r[i]))",
+        },
+    }
+    write_json(json_path, payload)
+
+    namespace = f"rd_{variant}_{kernel}_model"
+    feature_names = ",\n        ".join(f'"{name}"' for name in params["feature_order"])
+    header = f"""#pragma once
+
+#include <array>
+#include <cmath>
+#include <cstddef>
+
+namespace {namespace}
+{{
+    inline constexpr std::size_t kFeatureCount = {len(r_cols)};
+
+    // Input order must be r1, r2, ..., r10 from the {variant} RD extractor.
+    inline constexpr std::array<const char*, kFeatureCount> kFeatureNames = {{
+        {feature_names}
+    }};
+
+    inline constexpr std::array<double, kFeatureCount> kImputerMedian = {{
+        {_cpp_array(params["imputer_median"])}
+    }};
+
+    inline constexpr std::array<double, kFeatureCount> kScalerMean = {{
+        {_cpp_array(params["scaler_mean"])}
+    }};
+
+    inline constexpr std::array<double, kFeatureCount> kScalerScale = {{
+        {_cpp_array(params["scaler_scale"])}
+    }};
+
+    inline constexpr std::array<double, kFeatureCount> kScaledCoef = {{
+        {_cpp_array(params["coef_scaled"])}
+    }};
+
+    inline constexpr double kScaledIntercept =
+        {params["intercept_scaled"]:.17e};
+
+    // StandardScaler has been folded into these parameters.
+    inline constexpr std::array<double, kFeatureCount> kRawCoef = {{
+        {_cpp_array(params["coef_raw"])}
+    }};
+
+    inline constexpr double kRawIntercept =
+        {params["intercept_raw"]:.17e};
+
+    inline double PredictLogSpeedup(
+        const std::array<double, kFeatureCount>& rd_feature)
+    {{
+        double value = kRawIntercept;
+        for(std::size_t i = 0; i < kFeatureCount; ++i)
+        {{
+            value += kRawCoef[i] * rd_feature[i];
+        }}
+        return value;
+    }}
+
+    inline double PredictSpeedup(
+        const std::array<double, kFeatureCount>& rd_feature)
+    {{
+        return std::exp(PredictLogSpeedup(rd_feature));
+    }}
+
+    inline double PredictSpeedupWithPreprocess(
+        std::array<double, kFeatureCount> rd_feature,
+        const std::array<bool, kFeatureCount>& missing)
+    {{
+        double value = kScaledIntercept;
+        for(std::size_t i = 0; i < kFeatureCount; ++i)
+        {{
+            const double x = missing[i] ? kImputerMedian[i] : rd_feature[i];
+            const double standardized = (x - kScalerMean[i]) / kScalerScale[i];
+            value += kScaledCoef[i] * standardized;
+        }}
+        return std::exp(value);
+    }}
+}}
+"""
+    hpp_path.write_text(header, encoding="utf-8")
+
+    verification_parts: List[pd.DataFrame] = []
+    for dataset_name, frame in verification_frames.items():
+        if len(frame) == 0:
+            continue
+        x = frame[r_cols].copy()
+        sklearn_log = np.asarray(pipe.predict(x), dtype=np.float64)
+        x_raw = x.to_numpy(dtype=np.float64)
+        raw_log = params["intercept_raw"] + x_raw @ params["coef_raw"]
+        part = pd.DataFrame(
+            {
+                "dataset": dataset_name,
+                "graph_id": frame["graph_id"].astype(str).to_numpy(),
+                "sklearn_pred_log_speedup": sklearn_log,
+                "raw_formula_pred_log_speedup": raw_log,
+                "abs_log_difference": np.abs(sklearn_log - raw_log),
+                "sklearn_pred_speedup": np.exp(sklearn_log),
+                "raw_formula_pred_speedup": np.exp(raw_log),
+                "abs_speedup_difference": np.abs(np.exp(sklearn_log) - np.exp(raw_log)),
+            }
+        )
+        verification_parts.append(part)
+
+    verification_df = pd.concat(verification_parts, ignore_index=True)
+    verification_df.to_csv(verification_path, index=False)
+
+    max_log_diff = float(verification_df["abs_log_difference"].max())
+    max_speedup_diff = float(verification_df["abs_speedup_difference"].max())
+    if max_log_diff > 1e-10 or max_speedup_diff > 1e-10:
+        raise RuntimeError(
+            f"[{variant}] exported raw model does not reproduce sklearn: "
+            f"max log diff={max_log_diff}, max speedup diff={max_speedup_diff}"
+        )
+
+    return {
+        "csv": csv_path,
+        "json": json_path,
+        "hpp": hpp_path,
+        "verification": verification_path,
+    }
+
+
+# =========================================================
+# Splits and evaluation
+# =========================================================
+
+
+def build_row_group_splits(df: pd.DataFrame, n_splits: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    groups = df["base_graph"].astype(str).to_numpy()
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < n_splits:
+        raise ValueError(f"n_splits={n_splits} > unique groups={len(unique_groups)}")
+
+    splitter = GroupKFold(n_splits=n_splits)
+    x_dummy = np.zeros((len(df), 1), dtype=float)
+    y_dummy = np.zeros(len(df), dtype=float)
+    return [(train_idx, test_idx) for train_idx, test_idx in splitter.split(x_dummy, y_dummy, groups)]
+
+
+def build_graph_folds(common_graphs: Sequence[str], n_splits: int) -> List[GraphFold]:
+    graphs = np.asarray(sorted(set(map(str, common_graphs)), key=natural_graph_key), dtype=object)
+    if len(graphs) < n_splits:
+        raise ValueError(f"n_splits={n_splits} > common graphs={len(graphs)}")
+
+    splitter = GroupKFold(n_splits=n_splits)
+    dummy_x = np.zeros((len(graphs), 1), dtype=float)
+    dummy_y = np.zeros(len(graphs), dtype=float)
+
+    folds: List[GraphFold] = []
+    for fold_id, (train_idx, test_idx) in enumerate(
+        splitter.split(dummy_x, dummy_y, groups=graphs), start=1
+    ):
+        train_graphs = tuple(str(x) for x in graphs[train_idx])
+        test_graphs = tuple(str(x) for x in graphs[test_idx])
+        if set(train_graphs) & set(test_graphs):
+            raise RuntimeError(f"Graph leakage in fold {fold_id}")
+        folds.append(GraphFold(fold_id, train_graphs, test_graphs))
+    return folds
+
+
+def save_graph_folds(folds: Sequence[GraphFold], path: Path) -> None:
     rows: List[Dict[str, object]] = []
-
-    for fold_id, (tr_idx, va_idx) in enumerate(gkf.split(X, y_log, groups=groups), start=1):
-        X_tr = X.iloc[tr_idx]
-        X_va = X.iloc[va_idx]
-        y_tr = y_log[tr_idx]
-        y_va = y_log[va_idx]
-
-        tr_groups = set(groups.iloc[tr_idx].tolist())
-        va_groups = set(groups.iloc[va_idx].tolist())
-        overlap = tr_groups & va_groups
-        if overlap:
-            raise ValueError(f"Fold {fold_id} has group leakage: {overlap}")
-
-        pipe = make_pipe(r_cols)
-        pipe.fit(X_tr, y_tr)
-        pred_log = pipe.predict(X_va)
-        oof_pred_log[va_idx] = pred_log
-        metrics = eval_regression(y_va, pred_log)
-
-        rows.append({
-            "fold": fold_id,
-            "n_train": int(len(tr_idx)),
-            "n_valid": int(len(va_idx)),
-            "train_base_graphs": int(len(tr_groups)),
-            "valid_base_graphs": int(len(va_groups)),
-            **metrics,
-        })
-
-    folds_df = pd.DataFrame(rows)
-    oof_metrics = eval_regression(y_log, oof_pred_log)
-    summary_df = pd.DataFrame([{
-        "cv_type": "GroupKFold(base_graph) on augmented samples",
-        "cv_folds": int(cv_folds),
-        "mae_log_mean": float(folds_df["mae_log"].mean()),
-        "mae_log_std": float(folds_df["mae_log"].std(ddof=1)),
-        "spearman_mean": float(folds_df["spearman"].mean()),
-        "spearman_std": float(folds_df["spearman"].std(ddof=1)),
-        "mae_speedup_mean": float(folds_df["mae_speedup"].mean()),
-        "mae_speedup_std": float(folds_df["mae_speedup"].std(ddof=1)),
-        "mape_mean": float(folds_df["mape"].mean()),
-        "mape_std": float(folds_df["mape"].std(ddof=1)),
-        "oof_mae_log": oof_metrics["mae_log"],
-        "oof_spearman": oof_metrics["spearman"],
-        "oof_mae_speedup": oof_metrics["mae_speedup"],
-        "oof_mape": oof_metrics["mape"],
-    }])
-
-    oof_df = train_df[["graph_id", "base_graph", "speedup"] + r_cols].copy().reset_index(drop=True)
-    oof_df["true_log_speedup"] = y_log
-    oof_df["pred_log_speedup"] = oof_pred_log
-    oof_df["pred_speedup"] = np.exp(oof_pred_log)
-    oof_df["abs_err_speedup"] = np.abs(oof_df["pred_speedup"] - oof_df["speedup"])
-    oof_df["ape"] = oof_df["abs_err_speedup"] / np.maximum(np.abs(oof_df["speedup"]), EPS)
-
-    folds_df.to_csv(f"{save_prefix}_folds.csv", index=False)
-    summary_df.to_csv(f"{save_prefix}_summary.csv", index=False)
-    oof_df.to_csv(f"{save_prefix}_oof_predictions.csv", index=False)
-
-    return folds_df, summary_df, oof_df
+    for fold in folds:
+        rows.extend(
+            {"fold": fold.fold, "base_graph": graph, "role": "train"}
+            for graph in fold.train_graphs
+        )
+        rows.extend(
+            {"fold": fold.fold, "base_graph": graph, "role": "test"}
+            for graph in fold.test_graphs
+        )
+    pd.DataFrame(rows).to_csv(path, index=False)
 
 
+def evaluate_regression(y_true_log: Sequence[float], y_pred_log: Sequence[float]) -> Dict[str, float]:
+    true_log = np.asarray(y_true_log, dtype=float)
+    pred_log = np.asarray(y_pred_log, dtype=float)
+    true_speedup = np.exp(true_log)
+    pred_speedup = np.exp(pred_log)
 
-def fit_and_eval(train_df: pd.DataFrame, test_df: pd.DataFrame, r_cols: List[str], exp_name: str, out_dir: Path) -> Tuple[Pipeline, Dict[str, float], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    X_train = train_df[r_cols].copy()
-    X_test = test_df[r_cols].copy()
+    return {
+        "mae_log": float(mean_absolute_error(true_log, pred_log)),
+        "rmse_log": float(np.sqrt(mean_squared_error(true_log, pred_log))),
+        "r2_log": float(r2_score(true_log, pred_log)) if len(true_log) >= 2 else np.nan,
+        "spearman": spearman_corr(true_speedup, pred_speedup),
+        "pearson_log": pearson_corr(true_log, pred_log),
+        "mae_speedup": float(mean_absolute_error(true_speedup, pred_speedup)),
+        "rmse_speedup": float(np.sqrt(mean_squared_error(true_speedup, pred_speedup))),
+        "mape": mape(true_speedup, pred_speedup),
+        "smape": symmetric_mape(true_speedup, pred_speedup),
+    }
+
+
+def prediction_dataframe(
+    source_df: pd.DataFrame,
+    pred_log: Sequence[float],
+    variant: str,
+    experiment: str,
+    fold: Optional[int] = None,
+) -> pd.DataFrame:
+    true_speedup = source_df["speedup"].to_numpy(dtype=float)
+    true_log = np.log(true_speedup)
+    pred_log_arr = np.asarray(pred_log, dtype=float)
+    pred_speedup = np.exp(pred_log_arr)
+
+    out = source_df[
+        ["graph_id", "base_graph", "kernel", "dataset", "speedup", *canonical_r_cols()]
+    ].copy()
+    out["feature_variant"] = variant
+    out["experiment"] = experiment
+    if fold is not None:
+        out["fold"] = fold
+    out["true_log_speedup"] = true_log
+    out["pred_log_speedup"] = pred_log_arr
+    out["pred_speedup"] = pred_speedup
+    out["signed_error_speedup"] = pred_speedup - true_speedup
+    out["abs_error_speedup"] = np.abs(pred_speedup - true_speedup)
+    out["ape"] = out["abs_error_speedup"] / np.maximum(np.abs(true_speedup), EPS)
+    out["true_beneficial"] = true_speedup > 1.0
+    return out
+
+
+def fit_and_predict(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    variant: str,
+    ridge_alpha: float,
+    experiment: str,
+    fold: Optional[int] = None,
+) -> Tuple[Pipeline, Dict[str, float], pd.DataFrame]:
+    r_cols = canonical_r_cols()
+    pipe = make_pipeline(r_cols, ridge_alpha)
     y_train_log = np.log(train_df["speedup"].to_numpy(dtype=float))
-    y_test_log = np.log(test_df["speedup"].to_numpy(dtype=float))
+    pipe.fit(train_df[r_cols], y_train_log)
 
-    pipe = make_pipe(r_cols)
-    pipe.fit(X_train, y_train_log)
-    y_pred_log = pipe.predict(X_test)
-    metrics = eval_regression(y_test_log, y_pred_log)
-
-    pred_df = test_df[["graph_id", "base_graph", "speedup"] + r_cols].copy()
-    pred_df["true_log_speedup"] = y_test_log
-    pred_df["pred_log_speedup"] = y_pred_log
-    pred_df["pred_speedup"] = np.exp(y_pred_log)
-    pred_df["abs_err_speedup"] = np.abs(pred_df["pred_speedup"] - pred_df["speedup"])
-    pred_df["ape"] = pred_df["abs_err_speedup"] / np.maximum(np.abs(pred_df["speedup"]), EPS)
-    pred_df.to_csv(out_dir / f"{exp_name}_predictions.csv", index=False)
-
-    graph_rows: List[Dict[str, object]] = []
-    for g, sub in pred_df.groupby("base_graph"):
-        graph_rows.append({
-            "base_graph": g,
-            "n_samples": int(len(sub)),
-            "mae_log": float(mean_absolute_error(sub["true_log_speedup"], sub["pred_log_speedup"])),
-            "spearman_log": float(spearman_corr(sub["true_log_speedup"], sub["pred_log_speedup"])),
-            "mae_speedup": float(mean_absolute_error(sub["speedup"], sub["pred_speedup"])),
-            "mape": float(mape(sub["speedup"], sub["pred_speedup"], eps=EPS)),
-            "true_speedup_mean": float(sub["speedup"].mean()),
-            "pred_speedup_mean": float(sub["pred_speedup"].mean()),
-        })
-    per_graph_df = pd.DataFrame(graph_rows).sort_values("mape", ascending=False)
-    per_graph_df.to_csv(out_dir / f"{exp_name}_per_graph.csv", index=False)
-
-    feature_names = pipe.named_steps["preprocess"].get_feature_names_out()
-    coefs = pipe.named_steps["model"].coef_
-    coef_df = pd.DataFrame({
-        "feature": feature_names,
-        "coef": coefs,
-        "abs_coef": np.abs(coefs),
-    }).sort_values("abs_coef", ascending=False)
-    coef_df.to_csv(out_dir / f"{exp_name}_coefficients.csv", index=False)
-
-    return pipe, metrics, pred_df, per_graph_df, coef_df
+    pred_log = pipe.predict(test_df[r_cols])
+    metrics = evaluate_regression(np.log(test_df["speedup"].to_numpy(dtype=float)), pred_log)
+    pred_df = prediction_dataframe(test_df, pred_log, variant, experiment, fold)
+    return pipe, metrics, pred_df
 
 
-
-def run_band_gate_scan(pred_df: pd.DataFrame, tau_pairs: Iterable[Tuple[float, float]], save_csv_path: Path) -> pd.DataFrame:
-    """
-    三值门控:
-      relabel    if pred >= tau_h
-      skip       if pred <= tau_l
-      uncertain  otherwise
-
-    正类: true speedup > 1.
-    Coverage / Accuracy / Precision / Recall are computed on definite decisions only.
-    """
+def run_band_gate_scan(
+    pred_df: pd.DataFrame,
+    tau_pairs: Iterable[Tuple[float, float]],
+) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
-    y_true = pred_df["speedup"].to_numpy(dtype=float)
-    y_pred = pred_df["pred_speedup"].to_numpy(dtype=float)
-    y_true_pos = y_true > 1.0
+    true_speedup = pred_df["speedup"].to_numpy(dtype=float)
+    pred_speedup = pred_df["pred_speedup"].to_numpy(dtype=float)
+    true_positive = true_speedup > 1.0
 
     for tau_l, tau_h in tau_pairs:
         decision = np.full(len(pred_df), "uncertain", dtype=object)
-        decision[y_pred >= tau_h] = "relabel"
-        decision[y_pred <= tau_l] = "skip"
+        decision[pred_speedup >= tau_h] = "relabel"
+        decision[pred_speedup <= tau_l] = "skip"
+        decided = decision != "uncertain"
 
-        decided_mask = decision != "uncertain"
-        n_total = len(pred_df)
-        n_decided = int(np.sum(decided_mask))
-        coverage = n_decided / n_total if n_total else np.nan
+        predicted_positive = decision[decided] == "relabel"
+        actual_positive = true_positive[decided]
 
-        if n_decided == 0:
-            rows.append({
+        tp = int(np.sum(predicted_positive & actual_positive))
+        tn = int(np.sum((~predicted_positive) & (~actual_positive)))
+        fp = int(np.sum(predicted_positive & (~actual_positive)))
+        fn = int(np.sum((~predicted_positive) & actual_positive))
+        count = tp + tn + fp + fn
+
+        rows.append(
+            {
                 "tau_l": tau_l,
                 "tau_h": tau_h,
-                "coverage": coverage,
-                "accuracy": np.nan,
-                "precision": np.nan,
-                "recall": np.nan,
-                "tp": 0,
-                "tn": 0,
-                "fp": 0,
-                "fn": 0,
-                "num_decided": 0,
-                "num_total": n_total,
-            })
-            continue
+                "coverage": float(np.mean(decided)) if len(decided) else np.nan,
+                "accuracy": (tp + tn) / count if count else np.nan,
+                "precision": tp / (tp + fp) if (tp + fp) else np.nan,
+                "recall": tp / (tp + fn) if (tp + fn) else np.nan,
+                "specificity": tn / (tn + fp) if (tn + fp) else np.nan,
+                "tp": tp,
+                "tn": tn,
+                "fp": fp,
+                "fn": fn,
+                "num_decided": int(np.sum(decided)),
+                "num_total": int(len(pred_df)),
+            }
+        )
 
-        d_true = y_true_pos[decided_mask]
-        d_pred_pos = decision[decided_mask] == "relabel"
-        tp = int(np.sum((d_pred_pos == 1) & (d_true == 1)))
-        tn = int(np.sum((d_pred_pos == 0) & (d_true == 0)))
-        fp = int(np.sum((d_pred_pos == 1) & (d_true == 0)))
-        fn = int(np.sum((d_pred_pos == 0) & (d_true == 1)))
-        denom_acc = tp + tn + fp + fn
-
-        rows.append({
-            "tau_l": tau_l,
-            "tau_h": tau_h,
-            "coverage": coverage,
-            "accuracy": (tp + tn) / denom_acc if denom_acc else np.nan,
-            "precision": tp / (tp + fp) if (tp + fp) else np.nan,
-            "recall": tp / (tp + fn) if (tp + fn) else np.nan,
-            "tp": tp,
-            "tn": tn,
-            "fp": fp,
-            "fn": fn,
-            "num_decided": n_decided,
-            "num_total": n_total,
-        })
-
-    out_df = pd.DataFrame(rows)
-    out_df.to_csv(save_csv_path, index=False)
-    return out_df
+    return pd.DataFrame(rows)
 
 
-
-def run_conservative_gate(pred_df: pd.DataFrame, tau_h_values: Iterable[float], save_csv_path: Path) -> pd.DataFrame:
-    """
-    Deployment-style gate:
-      relabel only if pred_speedup >= tau_h; otherwise keep original labeling.
-
-    effective_speedup = true_speedup for selected samples, 1.0 otherwise.
-    This estimates the average speedup achieved by the predictor gate itself,
-    not just the classification quality.
-    """
+def run_conservative_gate(
+    pred_df: pd.DataFrame,
+    tau_h_values: Iterable[float],
+) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
-    y_true = pred_df["speedup"].to_numpy(dtype=float)
-    y_pred = pred_df["pred_speedup"].to_numpy(dtype=float)
-    true_pos = y_true > 1.0
+    true_speedup = pred_df["speedup"].to_numpy(dtype=float)
+    pred_speedup = pred_df["pred_speedup"].to_numpy(dtype=float)
+    true_positive = true_speedup > 1.0
 
     for tau_h in tau_h_values:
-        relabel = y_pred >= tau_h
-        effective = np.where(relabel, y_true, 1.0)
+        relabel = pred_speedup >= tau_h
+        effective_speedup = np.where(relabel, true_speedup, 1.0)
         selected = int(np.sum(relabel))
-        bad_selected = int(np.sum(relabel & (~true_pos)))
-        missed_good = int(np.sum((~relabel) & true_pos))
-        rows.append({
-            "tau_h": tau_h,
-            "selected_relabel": selected,
-            "selection_rate": selected / len(pred_df) if len(pred_df) else np.nan,
-            "bad_selected_speedup_le1": bad_selected,
-            "missed_good_speedup_gt1": missed_good,
-            "mean_effective_speedup": float(np.mean(effective)),
-            "median_effective_speedup": float(np.median(effective)),
-            "oracle_relabel_all_mean_speedup": float(np.mean(y_true)),
-            "oracle_relabel_only_true_positive_mean_effective_speedup": float(np.mean(np.where(true_pos, y_true, 1.0))),
-        })
+        good_selected = int(np.sum(relabel & true_positive))
+        bad_selected = int(np.sum(relabel & (~true_positive)))
+        missed_good = int(np.sum((~relabel) & true_positive))
 
-    out_df = pd.DataFrame(rows)
-    out_df.to_csv(save_csv_path, index=False)
-    return out_df
+        rows.append(
+            {
+                "tau_h": tau_h,
+                "selected_relabel": selected,
+                "selection_rate": selected / len(pred_df) if len(pred_df) else np.nan,
+                "good_selected": good_selected,
+                "bad_selected_speedup_le1": bad_selected,
+                "selection_precision": good_selected / selected if selected else np.nan,
+                "missed_good_speedup_gt1": missed_good,
+                "mean_effective_speedup": float(np.mean(effective_speedup)),
+                "median_effective_speedup": float(np.median(effective_speedup)),
+                "geomean_effective_speedup": float(np.exp(np.mean(np.log(effective_speedup)))),
+                "always_relabel_mean_speedup": float(np.mean(true_speedup)),
+                "oracle_mean_effective_speedup": float(
+                    np.mean(np.where(true_positive, true_speedup, 1.0))
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
+def save_gate_tables(pred_df: pd.DataFrame, prefix: Path) -> Dict[str, pd.DataFrame]:
+    band = run_band_gate_scan(pred_df, BAND_GATE_PAIRS)
+    conservative = run_conservative_gate(pred_df, [pair[1] for pair in BAND_GATE_PAIRS])
+    band.to_csv(f"{prefix}_band_gate.csv", index=False)
+    conservative.to_csv(f"{prefix}_conservative_gate.csv", index=False)
+    return {"band": band, "conservative": conservative}
 
-def run_heldout_original_graph_cv(
+
+def run_augmented_group_cv(
+    train_df: pd.DataFrame,
+    variant: str,
+    graph_folds: Sequence[GraphFold],
+    ridge_alpha: float,
+    out_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Grouped CV on augmented rows using the shared graph folds."""
+    experiment = "A_group_cv_augmented"
+    pred_parts: List[pd.DataFrame] = []
+    fold_rows: List[Dict[str, object]] = []
+
+    for fold in graph_folds:
+        train_part = train_df[train_df["base_graph"].isin(fold.train_graphs)]
+        valid_part = train_df[train_df["base_graph"].isin(fold.test_graphs)]
+
+        if len(train_part) == 0 or len(valid_part) == 0:
+            raise RuntimeError(
+                f"[{train_df['kernel'].iloc[0]}/{variant}] empty augmented fold {fold.fold}"
+            )
+
+        train_groups = set(train_part["base_graph"].astype(str))
+        valid_groups = set(valid_part["base_graph"].astype(str))
+        if train_groups & valid_groups:
+            raise RuntimeError(
+                f"[{train_df['kernel'].iloc[0]}/{variant}] graph leakage in fold {fold.fold}"
+            )
+
+        _, metrics, pred_df = fit_and_predict(
+            train_part,
+            valid_part,
+            variant,
+            ridge_alpha,
+            experiment,
+            fold.fold,
+        )
+        pred_parts.append(pred_df)
+        fold_rows.append(
+            {
+                "kernel": str(train_df["kernel"].iloc[0]),
+                "feature_variant": variant,
+                "experiment": experiment,
+                "fold": fold.fold,
+                "train_rows": int(len(train_part)),
+                "valid_rows": int(len(valid_part)),
+                "train_base_graphs": int(len(train_groups)),
+                "valid_base_graphs": int(len(valid_groups)),
+                **metrics,
+            }
+        )
+
+    oof_df = pd.concat(pred_parts, ignore_index=True)
+    if len(oof_df) != len(train_df):
+        raise RuntimeError(
+            f"[{train_df['kernel'].iloc[0]}/{variant}] augmented OOF coverage "
+            f"{len(oof_df)} != {len(train_df)}"
+        )
+    if oof_df["graph_id"].duplicated().any():
+        raise RuntimeError(
+            f"[{train_df['kernel'].iloc[0]}/{variant}] duplicate augmented OOF predictions"
+        )
+
+    oof_metrics = evaluate_regression(
+        oof_df["true_log_speedup"], oof_df["pred_log_speedup"]
+    )
+    folds_df = pd.DataFrame(fold_rows)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "kernel": str(train_df["kernel"].iloc[0]),
+                "feature_variant": variant,
+                "experiment": experiment,
+                "split_type": "Shared GroupKFold by base graph on augmented samples",
+                "cv_folds": int(len(graph_folds)),
+                "oof_rows": int(len(oof_df)),
+                **{f"oof_{key}": value for key, value in oof_metrics.items()},
+                "fold_mae_log_mean": float(folds_df["mae_log"].mean()),
+                "fold_mae_log_std": float(folds_df["mae_log"].std(ddof=1)),
+                "fold_spearman_mean": float(folds_df["spearman"].mean()),
+                "fold_spearman_std": float(folds_df["spearman"].std(ddof=1)),
+                "fold_mape_mean": float(folds_df["mape"].mean()),
+                "fold_mape_std": float(folds_df["mape"].std(ddof=1)),
+            }
+        ]
+    )
+
+    folds_df.to_csv(out_dir / f"{experiment}_folds.csv", index=False)
+    summary_df.to_csv(out_dir / f"{experiment}_summary.csv", index=False)
+    oof_df.to_csv(out_dir / f"{experiment}_oof_predictions.csv", index=False)
+    save_gate_tables(oof_df, out_dir / f"{experiment}_oof")
+    return summary_df, folds_df, oof_df
+
+def run_heldout_sparse_graphs(
+    train_df: pd.DataFrame,
+    sparse_df: pd.DataFrame,
+    variant: str,
+    graph_folds: Sequence[GraphFold],
+    ridge_alpha: float,
+    out_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    experiment = "C_heldout_sparse_graphs"
+    pred_parts: List[pd.DataFrame] = []
+    fold_rows: List[Dict[str, object]] = []
+
+    for fold in graph_folds:
+        train_part = train_df[train_df["base_graph"].isin(fold.train_graphs)]
+        test_part = sparse_df[sparse_df["base_graph"].isin(fold.test_graphs)]
+
+        if len(train_part) == 0 or len(test_part) == 0:
+            raise RuntimeError(
+                f"[{train_df['kernel'].iloc[0]}/{variant}] empty held-out fold {fold.fold}"
+            )
+
+        _, metrics, pred_df = fit_and_predict(
+            train_part,
+            test_part,
+            variant,
+            ridge_alpha,
+            experiment,
+            fold.fold,
+        )
+        pred_parts.append(pred_df)
+        fold_rows.append(
+            {
+                "kernel": str(train_df["kernel"].iloc[0]),
+                "feature_variant": variant,
+                "experiment": experiment,
+                "fold": fold.fold,
+                "train_augmented_rows": int(len(train_part)),
+                "test_original_rows": int(len(test_part)),
+                "train_base_graphs": int(len(fold.train_graphs)),
+                "test_base_graphs": int(len(fold.test_graphs)),
+                **metrics,
+            }
+        )
+
+    oof_df = pd.concat(pred_parts, ignore_index=True)
+    if oof_df["graph_id"].duplicated().any():
+        raise RuntimeError(f"[{train_df['kernel'].iloc[0]}/{variant}] duplicate held-out predictions")
+    if len(oof_df) != len(sparse_df):
+        raise RuntimeError(
+            f"[{train_df['kernel'].iloc[0]}/{variant}] held-out predictions cover "
+            f"{len(oof_df)} rows, expected {len(sparse_df)}"
+        )
+
+    overall = evaluate_regression(
+        oof_df["true_log_speedup"], oof_df["pred_log_speedup"]
+    )
+    folds_df = pd.DataFrame(fold_rows)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "kernel": str(train_df["kernel"].iloc[0]),
+                "feature_variant": variant,
+                "experiment": experiment,
+                "split_type": (
+                    "Train augmented samples from training graphs; "
+                    "test original held-out graphs"
+                ),
+                "cv_folds": int(len(graph_folds)),
+                "oof_test_rows": int(len(oof_df)),
+                **{f"oof_{key}": value for key, value in overall.items()},
+                "fold_mae_log_mean": float(folds_df["mae_log"].mean()),
+                "fold_mae_log_std": float(folds_df["mae_log"].std(ddof=1)),
+                "fold_spearman_mean": float(folds_df["spearman"].mean()),
+                "fold_spearman_std": float(folds_df["spearman"].std(ddof=1)),
+                "fold_mape_mean": float(folds_df["mape"].mean()),
+                "fold_mape_std": float(folds_df["mape"].std(ddof=1)),
+            }
+        ]
+    )
+
+    folds_df.to_csv(out_dir / f"{experiment}_folds.csv", index=False)
+    summary_df.to_csv(out_dir / f"{experiment}_summary.csv", index=False)
+    oof_df.to_csv(out_dir / f"{experiment}_oof_predictions.csv", index=False)
+    save_gate_tables(oof_df, out_dir / f"{experiment}_oof")
+    return summary_df, folds_df, oof_df
+
+def run_single_fit_experiment(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    r_cols: List[str],
-    kernel: str,
-    cv_folds: int,
+    variant: str,
+    ridge_alpha: float,
+    experiment: str,
+    description: str,
     out_dir: Path,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Leakage-free real-world generalization test.
-
-    Split by base_graph. For each fold:
-      - training set: augmented local-swap samples from training base graphs only;
-      - test set: original SuiteSparse samples from held-out base graphs only.
-
-    This directly addresses the S2O leakage/generalization concern: no augmented
-    version of a held-out test graph appears in the training set.
-    """
-    exp_name = f"{kernel}_expC_heldoutGraphs_trainAug_testOriginal"
-
-    train_graphs = set(train_df["base_graph"].astype(str))
-    test_graphs = set(test_df["base_graph"].astype(str))
-    common_graphs = sorted(train_graphs & test_graphs)
-
-    if len(common_graphs) < cv_folds:
-        raise ValueError(
-            f"[{kernel}] Need at least {cv_folds} common base graphs for held-out graph CV, "
-            f"but only found {len(common_graphs)}."
-        )
-
-    # Keep only graphs that exist in both augmented-train and original-test CSVs.
-    train_common = train_df[train_df["base_graph"].isin(common_graphs)].copy()
-    test_common = test_df[test_df["base_graph"].isin(common_graphs)].copy()
-
-    split_df = pd.DataFrame({"base_graph": common_graphs})
-    dummy_x = np.zeros((len(split_df), 1))
-    dummy_y = np.zeros(len(split_df))
-    groups = split_df["base_graph"].to_numpy()
-
-    gkf = GroupKFold(n_splits=cv_folds)
-    fold_rows: List[Dict[str, object]] = []
-    pred_parts: List[pd.DataFrame] = []
-    coef_parts: List[pd.DataFrame] = []
-    split_rows: List[Dict[str, object]] = []
-
-    for fold_id, (tr_g_idx, te_g_idx) in enumerate(gkf.split(dummy_x, dummy_y, groups=groups), start=1):
-        fold_train_graphs = set(split_df.iloc[tr_g_idx]["base_graph"].astype(str))
-        fold_test_graphs = set(split_df.iloc[te_g_idx]["base_graph"].astype(str))
-        overlap = fold_train_graphs & fold_test_graphs
-        if overlap:
-            raise ValueError(f"[{kernel}] Held-out fold {fold_id} has group leakage: {sorted(overlap)[:10]}")
-
-        fold_train_df = train_common[train_common["base_graph"].isin(fold_train_graphs)].copy()
-        fold_test_df = test_common[test_common["base_graph"].isin(fold_test_graphs)].copy()
-
-        if len(fold_train_df) == 0 or len(fold_test_df) == 0:
-            raise ValueError(f"[{kernel}] Fold {fold_id} has empty train or test data.")
-
-        fold_exp_name = f"{exp_name}_fold{fold_id}"
-        _, metrics, fold_pred_df, _, fold_coef_df = fit_and_eval(
-            fold_train_df,
-            fold_test_df,
-            r_cols,
-            exp_name=fold_exp_name,
-            out_dir=out_dir,
-        )
-
-        fold_pred_df = fold_pred_df.copy()
-        fold_pred_df["fold"] = fold_id
-        pred_parts.append(fold_pred_df)
-
-        fold_coef_df = fold_coef_df.copy()
-        fold_coef_df["fold"] = fold_id
-        coef_parts.append(fold_coef_df)
-
-        fold_rows.append({
-            "kernel": kernel,
-            "experiment": exp_name,
-            "fold": fold_id,
-            "train_aug_rows": int(len(fold_train_df)),
-            "test_original_rows": int(len(fold_test_df)),
-            "train_base_graphs": int(len(fold_train_graphs)),
-            "test_base_graphs": int(len(fold_test_graphs)),
-            "mae_log": metrics["mae_log"],
-            "spearman": metrics["spearman"],
-            "mae_speedup": metrics["mae_speedup"],
-            "mape": metrics["mape"],
-        })
-
-        for g in sorted(fold_train_graphs):
-            split_rows.append({"kernel": kernel, "experiment": exp_name, "fold": fold_id, "base_graph": g, "role": "train"})
-        for g in sorted(fold_test_graphs):
-            split_rows.append({"kernel": kernel, "experiment": exp_name, "fold": fold_id, "base_graph": g, "role": "test"})
-
-    folds_df = pd.DataFrame(fold_rows)
-    pred_oof_df = pd.concat(pred_parts, ignore_index=True)
-    coef_all_df = pd.concat(coef_parts, ignore_index=True)
-    split_all_df = pd.DataFrame(split_rows)
-
-    # Overall out-of-fold metrics on original held-out graphs.
-    overall = eval_regression(pred_oof_df["true_log_speedup"], pred_oof_df["pred_log_speedup"])
-    summary_df = pd.DataFrame([{
-        "kernel": kernel,
-        "experiment": exp_name,
-        "split_type": "Leakage-free GroupKFold by original base_graph",
-        "cv_folds": int(cv_folds),
-        "train_source": "augmented local-swap samples from training graphs only",
-        "test_source": "original samples from held-out graphs only",
-        "common_base_graphs_used": int(len(common_graphs)),
-        "oof_test_rows": int(len(pred_oof_df)),
-        "fold_mae_log_mean": float(folds_df["mae_log"].mean()),
-        "fold_mae_log_std": float(folds_df["mae_log"].std(ddof=1)),
-        "fold_spearman_mean": float(folds_df["spearman"].mean()),
-        "fold_spearman_std": float(folds_df["spearman"].std(ddof=1)),
-        "fold_mae_speedup_mean": float(folds_df["mae_speedup"].mean()),
-        "fold_mae_speedup_std": float(folds_df["mae_speedup"].std(ddof=1)),
-        "fold_mape_mean": float(folds_df["mape"].mean()),
-        "fold_mape_std": float(folds_df["mape"].std(ddof=1)),
-        "oof_mae_log": overall["mae_log"],
-        "oof_spearman": overall["spearman"],
-        "oof_mae_speedup": overall["mae_speedup"],
-        "oof_mape": overall["mape"],
-    }])
-
-    folds_df.to_csv(out_dir / f"{exp_name}_folds.csv", index=False)
-    summary_df.to_csv(out_dir / f"{exp_name}_summary.csv", index=False)
-    pred_oof_df.to_csv(out_dir / f"{exp_name}_oof_predictions.csv", index=False)
-    coef_all_df.to_csv(out_dir / f"{exp_name}_coefficients_by_fold.csv", index=False)
-    split_all_df.to_csv(out_dir / f"{exp_name}_graph_splits.csv", index=False)
-
-    band_gate_df = run_band_gate_scan(
-        pred_oof_df,
-        BAND_GATE_PAIRS,
-        save_csv_path=out_dir / f"{exp_name}_band_gate.csv",
+) -> Tuple[Pipeline, pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame]]:
+    pipe, metrics, pred_df = fit_and_predict(
+        train_df,
+        test_df,
+        variant,
+        ridge_alpha,
+        experiment,
     )
-    conservative_gate_df = run_conservative_gate(
-        pred_oof_df,
-        tau_h_values=[pair[1] for pair in BAND_GATE_PAIRS],
-        save_csv_path=out_dir / f"{exp_name}_conservative_gate.csv",
+    summary = pd.DataFrame(
+        [
+            {
+                "kernel": str(train_df["kernel"].iloc[0]),
+                "feature_variant": variant,
+                "experiment": experiment,
+                "description": description,
+                "train_rows": int(len(train_df)),
+                "test_rows": int(len(test_df)),
+                "train_base_graphs": int(train_df["base_graph"].nunique()),
+                "test_base_graphs": int(test_df["base_graph"].nunique()),
+                **metrics,
+            }
+        ]
+    )
+    pred_df.to_csv(out_dir / f"{experiment}_predictions.csv", index=False)
+    summary.to_csv(out_dir / f"{experiment}_summary.csv", index=False)
+    gate_tables = save_gate_tables(pred_df, out_dir / experiment)
+    return pipe, summary, pred_df, gate_tables
+
+def run_variant(
+    kernel: str,
+    variant: str,
+    train_df_dual: pd.DataFrame,
+    sparse_df_dual: pd.DataFrame,
+    rmat_df_dual: pd.DataFrame,
+    graph_folds: Sequence[GraphFold],
+    ridge_alpha: float,
+    root_out_dir: Path,
+) -> VariantResult:
+    variant_dir = ensure_directory(root_out_dir / variant)
+    train_df = make_feature_view(train_df_dual, variant)
+    sparse_df = make_feature_view(sparse_df_dual, variant)
+    rmat_df = make_feature_view(rmat_df_dual, variant)
+
+    exp_a_summary, _, pred_a = run_augmented_group_cv(
+        train_df,
+        variant,
+        graph_folds,
+        ridge_alpha,
+        variant_dir,
     )
 
-    return summary_df, folds_df, pred_oof_df, band_gate_df, conservative_gate_df
-
-
-
-def run_one_kernel(kernel: str, train_csv: Path, test_csv: Path, out_dir: Path) -> Dict[str, pd.DataFrame]:
-    print(f"\n==================== {kernel.upper()} ====================")
-
-    train_df, train_r_cols = load_and_clean(train_csv, f"{kernel}_train", base_graph_mode="swap")
-    test_df, test_r_cols = load_and_clean(test_csv, f"{kernel}_test_sparse", base_graph_mode="generic")
-    if train_r_cols != test_r_cols:
-        raise ValueError(f"[{kernel}] r columns do not match: train={train_r_cols}, test={test_r_cols}")
-    r_cols = train_r_cols
-
-    stats_df = pd.DataFrame([
-        dataset_stats(train_df, f"{kernel}_train", kernel),
-        dataset_stats(test_df, f"{kernel}_test_sparse", kernel),
-    ])
-    stats_df.to_csv(out_dir / f"{kernel}_dataset_stats.csv", index=False)
-
-    check_group_counts(train_df, f"{kernel}_train", out_dir, expected_group_size=9)
-    check_group_counts(test_df, f"{kernel}_test_sparse", out_dir, expected_group_size=1)
-    check_train_test_graph_overlap(train_df, test_df, kernel, out_dir)
-
-    # Experiment A: 5-fold GroupKFold on the augmented samples.
-    cv_prefix = out_dir / f"{kernel}_expA_5fold_groupkfold_on_trainAug"
-    _, cv_summary_df, _ = run_group_cv_once(train_df, r_cols, cv_folds=CV_FOLDS, save_prefix=cv_prefix)
-
-    # Experiment B: old S2O style. This is useful as an auxiliary same-graph test,
-    # but it should not be used as the main evidence for unseen-graph generalization.
-    exp_b_name = f"{kernel}_expB_trainAllAug_testOriginalSameGraphs"
-    _, test_metrics, pred_b_df, _, coef_b_df = fit_and_eval(train_df, test_df, r_cols, exp_name=exp_b_name, out_dir=out_dir)
-    exp_b_summary_df = pd.DataFrame([{
-        "kernel": kernel,
-        "experiment": exp_b_name,
-        "split_type": "Same graph set: augmented versions of test graphs appear in training",
-        "leakage_risk": "graph_identity_overlap",
-        "train_rows": int(len(train_df)),
-        "test_rows": int(len(test_df)),
-        "train_base_graphs": int(train_df["base_graph"].nunique()),
-        "test_base_graphs": int(test_df["base_graph"].nunique()),
-        "test_mae_log": test_metrics["mae_log"],
-        "test_spearman": test_metrics["spearman"],
-        "test_mae_speedup": test_metrics["mae_speedup"],
-        "test_mape": test_metrics["mape"],
-    }])
-    exp_b_summary_df.to_csv(out_dir / f"{exp_b_name}_summary.csv", index=False)
-
-    exp_b_band_gate_df = run_band_gate_scan(
-        pred_b_df,
-        BAND_GATE_PAIRS,
-        save_csv_path=out_dir / f"{exp_b_name}_band_gate.csv",
-    )
-    exp_b_conservative_gate_df = run_conservative_gate(
-        pred_b_df,
-        tau_h_values=[pair[1] for pair in BAND_GATE_PAIRS],
-        save_csv_path=out_dir / f"{exp_b_name}_conservative_gate.csv",
+    model_all_aug, exp_b_summary, pred_b, gate_b = run_single_fit_experiment(
+        train_df,
+        sparse_df,
+        variant,
+        ridge_alpha,
+        "B_same_graph_sparse",
+        (
+            "Train on all augmented SuiteSparse samples and test original "
+            "samples from the same graph set."
+        ),
+        variant_dir,
     )
 
-    # Experiment C: recommended leakage-free held-out original-graph evaluation.
-    exp_c_summary_df, exp_c_folds_df, pred_c_oof_df, exp_c_band_gate_df, exp_c_conservative_gate_df = run_heldout_original_graph_cv(
-        train_df=train_df,
-        test_df=test_df,
-        r_cols=r_cols,
+    exp_c_summary, _, pred_c = run_heldout_sparse_graphs(
+        train_df,
+        sparse_df,
+        variant,
+        graph_folds,
+        ridge_alpha,
+        variant_dir,
+    )
+
+    _, exp_d_summary, pred_d, gate_d = run_single_fit_experiment(
+        train_df,
+        rmat_df,
+        variant,
+        ridge_alpha,
+        "D_external_rmat",
+        "Train on all augmented SuiteSparse samples and test external RMAT graphs.",
+        variant_dir,
+    )
+
+    coefficient_table = model_parameter_dataframe(
+        model_all_aug, canonical_r_cols(), variant, kernel
+    )
+    coefficient_table.to_csv(variant_dir / "deploy_model_parameters.csv", index=False)
+    coefficient_table.sort_values("abs_ridge_coef_scaled", ascending=False).to_csv(
+        variant_dir / "deploy_model_coefficients_by_importance.csv", index=False
+    )
+
+    export_deployment_model(
+        model_all_aug,
+        canonical_r_cols(),
+        variant,
+        kernel,
+        variant_dir,
+        verification_frames={"sparse": sparse_df, "rmat": rmat_df},
+    )
+
+    summary_columns = [
+        "kernel",
+        "feature_variant",
+        "experiment",
+        "mae_log",
+        "rmse_log",
+        "r2_log",
+        "spearman",
+        "pearson_log",
+        "mae_speedup",
+        "rmse_speedup",
+        "mape",
+        "smape",
+    ]
+
+    exp_a_main = exp_a_summary.rename(
+        columns={
+            "oof_mae_log": "mae_log",
+            "oof_rmse_log": "rmse_log",
+            "oof_r2_log": "r2_log",
+            "oof_spearman": "spearman",
+            "oof_pearson_log": "pearson_log",
+            "oof_mae_speedup": "mae_speedup",
+            "oof_rmse_speedup": "rmse_speedup",
+            "oof_mape": "mape",
+            "oof_smape": "smape",
+        }
+    )[summary_columns]
+    exp_c_main = exp_c_summary.rename(
+        columns={
+            "oof_mae_log": "mae_log",
+            "oof_rmse_log": "rmse_log",
+            "oof_r2_log": "r2_log",
+            "oof_spearman": "spearman",
+            "oof_pearson_log": "pearson_log",
+            "oof_mae_speedup": "mae_speedup",
+            "oof_rmse_speedup": "rmse_speedup",
+            "oof_mape": "mape",
+            "oof_smape": "smape",
+        }
+    )[summary_columns]
+
+    master = pd.concat(
+        [
+            exp_a_main,
+            exp_b_summary[summary_columns],
+            exp_c_main,
+            exp_d_summary[summary_columns],
+        ],
+        ignore_index=True,
+    )
+    master["recommended_for_main_table"] = master["experiment"].isin(
+        ["C_heldout_sparse_graphs", "D_external_rmat"]
+    )
+    master.to_csv(variant_dir / "master_summary.csv", index=False)
+
+    return VariantResult(
         kernel=kernel,
-        cv_folds=CV_FOLDS,
-        out_dir=out_dir,
+        variant=variant,
+        model_all_aug=model_all_aug,
+        feature_cols=canonical_r_cols(),
+        master_summary=master,
+        predictions={
+            "A_group_cv_augmented": pred_a,
+            "B_same_graph_sparse": pred_b,
+            "C_heldout_sparse_graphs": pred_c,
+            "D_external_rmat": pred_d,
+        },
+        gate_tables={
+            "B_same_graph_sparse_band": gate_b["band"],
+            "B_same_graph_sparse_conservative": gate_b["conservative"],
+            "D_external_rmat_band": gate_d["band"],
+            "D_external_rmat_conservative": gate_d["conservative"],
+        },
+        coefficient_table=coefficient_table,
     )
 
-    exp_b_band_gate_df = exp_b_band_gate_df.assign(kernel=kernel, experiment=exp_b_name)
-    exp_c_band_gate_df = exp_c_band_gate_df.assign(kernel=kernel, experiment=str(exp_c_summary_df.iloc[0]["experiment"]))
-    all_band_gate_df = pd.concat([exp_b_band_gate_df, exp_c_band_gate_df], ignore_index=True)
+def compare_prediction_frames(
+    exact_df: pd.DataFrame,
+    sampled_df: pd.DataFrame,
+    experiment: str,
+    out_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    keys = ["kernel", "graph_id", "base_graph"]
+    optional_keys = [
+        column
+        for column in ["fold"]
+        if column in exact_df.columns and column in sampled_df.columns
+    ]
+    merge_keys = keys + optional_keys
 
-    exp_b_conservative_gate_df = exp_b_conservative_gate_df.assign(kernel=kernel, experiment=exp_b_name)
-    exp_c_conservative_gate_df = exp_c_conservative_gate_df.assign(kernel=kernel, experiment=str(exp_c_summary_df.iloc[0]["experiment"]))
-    all_conservative_gate_df = pd.concat([exp_b_conservative_gate_df, exp_c_conservative_gate_df], ignore_index=True)
+    selected = [
+        *merge_keys,
+        "dataset",
+        "speedup",
+        "pred_speedup",
+        "pred_log_speedup",
+        "abs_error_speedup",
+    ]
+    e = exact_df[selected].rename(
+        columns={
+            "dataset": "dataset_exact",
+            "speedup": "true_speedup_exact",
+            "pred_speedup": "pred_speedup_exact",
+            "pred_log_speedup": "pred_log_speedup_exact",
+            "abs_error_speedup": "abs_error_speedup_exact",
+        }
+    )
+    s = sampled_df[selected].rename(
+        columns={
+            "dataset": "dataset_sampled",
+            "speedup": "true_speedup_sampled",
+            "pred_speedup": "pred_speedup_sampled",
+            "pred_log_speedup": "pred_log_speedup_sampled",
+            "abs_error_speedup": "abs_error_speedup_sampled",
+        }
+    )
 
-    master_df = pd.DataFrame([
-        {
-            "kernel": kernel,
-            "experiment": "A_5fold_groupkfold_on_trainAug",
-            "recommended_for_paper_main_table": False,
-            "description": "Augmented-sample CV with base_graph groups held out inside the augmented set.",
-            "train_set": f"{kernel}_train_aug",
-            "test_set": "held-out augmented samples",
-            "cv_oof_spearman": float(cv_summary_df.iloc[0]["oof_spearman"]),
-            "cv_oof_mape": float(cv_summary_df.iloc[0]["oof_mape"]),
-            "test_spearman": np.nan,
-            "test_mape": np.nan,
-            "test_mae_log": np.nan,
-            "test_mae_speedup": np.nan,
-        },
-        {
-            "kernel": kernel,
-            "experiment": "B_trainAllAug_testOriginalSameGraphs",
-            "recommended_for_paper_main_table": False,
-            "description": "Old S2O/same-graph test; useful auxiliary result but has graph-identity overlap.",
-            "train_set": f"{kernel}_train_aug_all_graphs",
-            "test_set": f"{kernel}_test_original_same_graphs",
-            "cv_oof_spearman": np.nan,
-            "cv_oof_mape": np.nan,
-            "test_spearman": float(exp_b_summary_df.iloc[0]["test_spearman"]),
-            "test_mape": float(exp_b_summary_df.iloc[0]["test_mape"]),
-            "test_mae_log": float(exp_b_summary_df.iloc[0]["test_mae_log"]),
-            "test_mae_speedup": float(exp_b_summary_df.iloc[0]["test_mae_speedup"]),
-        },
-        {
-            "kernel": kernel,
-            "experiment": "C_heldoutGraphs_trainAug_testOriginal",
-            "recommended_for_paper_main_table": True,
-            "description": "Leakage-free unseen-graph test; train on augmented samples from training graphs, test on original held-out graphs.",
-            "train_set": f"{kernel}_train_aug_training_graphs_only",
-            "test_set": f"{kernel}_test_original_heldout_graphs",
-            "cv_oof_spearman": np.nan,
-            "cv_oof_mape": np.nan,
-            "test_spearman": float(exp_c_summary_df.iloc[0]["oof_spearman"]),
-            "test_mape": float(exp_c_summary_df.iloc[0]["oof_mape"]),
-            "test_mae_log": float(exp_c_summary_df.iloc[0]["oof_mae_log"]),
-            "test_mae_speedup": float(exp_c_summary_df.iloc[0]["oof_mae_speedup"]),
-        },
-    ])
-    master_df.to_csv(out_dir / f"{kernel}_master_summary.csv", index=False)
+    paired = pd.merge(e, s, on=merge_keys, how="inner", validate="one_to_one")
+    if len(paired) != len(exact_df) or len(paired) != len(sampled_df):
+        raise RuntimeError(
+            f"[{experiment}] exact/sample prediction alignment failed: "
+            f"exact={len(exact_df)}, sampled={len(sampled_df)}, merged={len(paired)}"
+        )
 
-    print(f"\n[{kernel}] Experiment A CV summary")
-    print(cv_summary_df.to_string(index=False))
-    print(f"\n[{kernel}] Experiment B same-graph test summary")
-    print(exp_b_summary_df.to_string(index=False))
-    print(f"\n[{kernel}] Experiment C leakage-free held-out graph summary")
-    print(exp_c_summary_df.to_string(index=False))
-    print(f"\n[{kernel}] All band-gate results")
-    print(all_band_gate_df.to_string(index=False))
-    print(f"\n[{kernel}] All conservative-gate results")
-    print(all_conservative_gate_df.to_string(index=False))
+    if not np.allclose(
+        paired["true_speedup_exact"],
+        paired["true_speedup_sampled"],
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise RuntimeError(f"[{experiment}] exact/sample true targets differ")
 
-    return {
-        "stats": stats_df,
-        "cv_summary": cv_summary_df.assign(kernel=kernel),
-        "exp_b_summary": exp_b_summary_df,
-        "exp_c_summary": exp_c_summary_df,
-        "exp_c_folds": exp_c_folds_df,
-        "band_gate": all_band_gate_df,
-        "conservative_gate": all_conservative_gate_df,
-        "pred": pred_b_df.assign(kernel=kernel, experiment=exp_b_name),
-        "pred_heldout": pred_c_oof_df.assign(kernel=kernel, experiment=str(exp_c_summary_df.iloc[0]["experiment"])),
-        "coef": coef_b_df.assign(kernel=kernel, experiment=exp_b_name),
-        "master": master_df,
+    paired["experiment"] = experiment
+    paired["true_speedup"] = paired["true_speedup_exact"]
+    paired["sampled_minus_exact_pred_speedup"] = (
+        paired["pred_speedup_sampled"] - paired["pred_speedup_exact"]
+    )
+    paired["abs_prediction_difference"] = np.abs(
+        paired["sampled_minus_exact_pred_speedup"]
+    )
+    paired["sampled_error_minus_exact_error"] = (
+        paired["abs_error_speedup_sampled"] - paired["abs_error_speedup_exact"]
+    )
+    paired["sampled_prediction_closer"] = (
+        paired["abs_error_speedup_sampled"] < paired["abs_error_speedup_exact"]
+    )
+    paired.to_csv(
+        out_dir / f"{experiment}_exact_vs_sampled_predictions.csv", index=False
+    )
+
+    kernel = str(paired["kernel"].iloc[0])
+    summary = pd.DataFrame(
+        [
+            {
+                "kernel": kernel,
+                "experiment": experiment,
+                "rows": int(len(paired)),
+                "mean_abs_exact_sampled_prediction_difference": float(
+                    paired["abs_prediction_difference"].mean()
+                ),
+                "median_abs_exact_sampled_prediction_difference": float(
+                    paired["abs_prediction_difference"].median()
+                ),
+                "max_abs_exact_sampled_prediction_difference": float(
+                    paired["abs_prediction_difference"].max()
+                ),
+                "pearson_between_predictions": pearson_corr(
+                    paired["pred_speedup_exact"], paired["pred_speedup_sampled"]
+                ),
+                "spearman_between_predictions": spearman_corr(
+                    paired["pred_speedup_exact"], paired["pred_speedup_sampled"]
+                ),
+                "mean_abs_error_exact": float(
+                    paired["abs_error_speedup_exact"].mean()
+                ),
+                "mean_abs_error_sampled": float(
+                    paired["abs_error_speedup_sampled"].mean()
+                ),
+                "sampled_minus_exact_mean_abs_error": float(
+                    paired["sampled_error_minus_exact_error"].mean()
+                ),
+                "num_sampled_closer": int(paired["sampled_prediction_closer"].sum()),
+                "fraction_sampled_closer": float(
+                    paired["sampled_prediction_closer"].mean()
+                ),
+            }
+        ]
+    )
+    summary.to_csv(
+        out_dir / f"{experiment}_exact_vs_sampled_summary.csv", index=False
+    )
+
+    disagreement_rows: List[Dict[str, object]] = []
+    true_speedup = paired["true_speedup"].to_numpy(dtype=float)
+    for tau_h in [pair[1] for pair in BAND_GATE_PAIRS]:
+        exact_select = paired["pred_speedup_exact"].to_numpy(dtype=float) >= tau_h
+        sampled_select = paired["pred_speedup_sampled"].to_numpy(dtype=float) >= tau_h
+        disagreement = exact_select != sampled_select
+        sampled_only = (~exact_select) & sampled_select
+        exact_only = exact_select & (~sampled_select)
+
+        disagreement_rows.append(
+            {
+                "kernel": kernel,
+                "experiment": experiment,
+                "tau_h": tau_h,
+                "rows": int(len(paired)),
+                "decision_disagreement_count": int(np.sum(disagreement)),
+                "decision_disagreement_rate": float(np.mean(disagreement)),
+                "sampled_only_select_count": int(np.sum(sampled_only)),
+                "exact_only_select_count": int(np.sum(exact_only)),
+                "sampled_only_bad_count": int(
+                    np.sum(sampled_only & (true_speedup <= 1.0))
+                ),
+                "exact_only_bad_count": int(
+                    np.sum(exact_only & (true_speedup <= 1.0))
+                ),
+            }
+        )
+
+    disagreement_df = pd.DataFrame(disagreement_rows)
+    disagreement_df.to_csv(
+        out_dir / f"{experiment}_gate_disagreement.csv", index=False
+    )
+    return paired, summary, disagreement_df
+
+def compare_variants(
+    exact_result: VariantResult,
+    sampled_result: VariantResult,
+    out_dir: Path,
+) -> pd.DataFrame:
+    if exact_result.kernel != sampled_result.kernel:
+        raise ValueError("Cannot compare feature variants from different kernels")
+
+    summaries: List[pd.DataFrame] = []
+    disagreements: List[pd.DataFrame] = []
+
+    for experiment in exact_result.predictions:
+        _, summary, disagreement = compare_prediction_frames(
+            exact_result.predictions[experiment],
+            sampled_result.predictions[experiment],
+            experiment,
+            out_dir,
+        )
+        summaries.append(summary)
+        disagreements.append(disagreement)
+
+    all_summary = pd.concat(summaries, ignore_index=True)
+    all_disagreement = pd.concat(disagreements, ignore_index=True)
+    all_summary.to_csv(
+        out_dir / "all_experiments_exact_vs_sampled_summary.csv", index=False
+    )
+    all_disagreement.to_csv(
+        out_dir / "all_experiments_gate_disagreement.csv", index=False
+    )
+
+    exact_master = exact_result.master_summary.copy()
+    sampled_master = sampled_result.master_summary.copy()
+    metrics = [
+        "mae_log",
+        "rmse_log",
+        "r2_log",
+        "spearman",
+        "pearson_log",
+        "mae_speedup",
+        "rmse_speedup",
+        "mape",
+        "smape",
+    ]
+
+    exact_wide = exact_master[["kernel", "experiment", *metrics]].rename(
+        columns={metric: f"exact_{metric}" for metric in metrics}
+    )
+    sampled_wide = sampled_master[["kernel", "experiment", *metrics]].rename(
+        columns={metric: f"sampled_{metric}" for metric in metrics}
+    )
+    metric_comparison = pd.merge(
+        exact_wide,
+        sampled_wide,
+        on=["kernel", "experiment"],
+        validate="one_to_one",
+    )
+    for metric in metrics:
+        metric_comparison[f"sampled_minus_exact_{metric}"] = (
+            metric_comparison[f"sampled_{metric}"]
+            - metric_comparison[f"exact_{metric}"]
+        )
+    metric_comparison.to_csv(
+        out_dir / "exact_vs_sampled_metric_comparison.csv", index=False
+    )
+    return metric_comparison
+
+def evaluate_existing_model_on_feature_view(
+    pipe: Pipeline,
+    test_df: pd.DataFrame,
+    trained_variant: str,
+    input_variant: str,
+    dataset_name: str,
+) -> Tuple[Dict[str, object], pd.DataFrame]:
+    pred_log = pipe.predict(test_df[canonical_r_cols()])
+    metrics = evaluate_regression(
+        np.log(test_df["speedup"].to_numpy(dtype=float)), pred_log
+    )
+    experiment = f"cross_train_{trained_variant}_input_{input_variant}_{dataset_name}"
+    pred_df = prediction_dataframe(test_df, pred_log, input_variant, experiment)
+    row = {
+        "kernel": str(test_df["kernel"].iloc[0]),
+        "trained_feature_variant": trained_variant,
+        "input_feature_variant": input_variant,
+        "dataset": dataset_name,
+        "experiment": experiment,
+        **metrics,
+    }
+    return row, pred_df
+
+def run_cross_feature_diagnostics(
+    exact_result: VariantResult,
+    sampled_result: VariantResult,
+    sparse_dual: pd.DataFrame,
+    rmat_dual: pd.DataFrame,
+    out_dir: Path,
+) -> pd.DataFrame:
+    if exact_result.kernel != sampled_result.kernel:
+        raise ValueError("Cross-feature diagnostics require the same kernel")
+
+    rows: List[Dict[str, object]] = []
+
+    for dataset_name, dual_df in {"sparse": sparse_dual, "rmat": rmat_dual}.items():
+        exact_view = make_feature_view(dual_df, "exact")
+        sampled_view = make_feature_view(dual_df, "sampled")
+
+        combinations = [
+            (exact_result.model_all_aug, "exact", exact_view, "exact"),
+            (exact_result.model_all_aug, "exact", sampled_view, "sampled"),
+            (sampled_result.model_all_aug, "sampled", sampled_view, "sampled"),
+            (sampled_result.model_all_aug, "sampled", exact_view, "exact"),
+        ]
+
+        for pipe, trained_variant, input_df, input_variant in combinations:
+            row, pred_df = evaluate_existing_model_on_feature_view(
+                pipe,
+                input_df,
+                trained_variant,
+                input_variant,
+                dataset_name,
+            )
+            rows.append(row)
+            pred_df.to_csv(
+                out_dir / f"{row['experiment']}_predictions.csv", index=False
+            )
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(out_dir / "cross_feature_compatibility_summary.csv", index=False)
+    return summary
+
+
+# =========================================================
+# Multi-backend orchestration and diagnostics
+# =========================================================
+
+
+def resolve_dataset_path(
+    data_dir: Path,
+    override: Optional[Path],
+    default_name: str,
+) -> Path:
+    """Resolve an optional CLI override or a file under --data-dir."""
+    return (override if override is not None else data_dir / default_name).resolve()
+
+
+def load_kernel_bundle(
+    kernel: str,
+    train_path: Path,
+    sparse_path: Path,
+    rmat_path: Path,
+) -> KernelBundle:
+    return KernelBundle(
+        kernel=kernel,
+        train=load_dual_feature_dataset(
+            train_path, "train_augmented", "swap", kernel
+        ),
+        sparse=load_dual_feature_dataset(
+            sparse_path, "test_sparse_original", "sparse", kernel
+        ),
+        rmat=load_dual_feature_dataset(
+            rmat_path, "test_rmat_external", "rmat", kernel
+        ),
+    )
+
+
+def validate_cross_kernel_feature_consistency(
+    bundles: Mapping[str, KernelBundle],
+    out_dir: Path,
+    atol: float = 1e-12,
+) -> pd.DataFrame:
+    """
+    RD features and extraction times are backend-independent. When both MERBIT
+    and CSR datasets are supplied, verify that corresponding rows contain the
+    same exact/sample features and timing measurements. Speedup targets may differ.
+    """
+    if not {"merbit", "csr"}.issubset(bundles):
+        return pd.DataFrame()
+
+    rows: List[Dict[str, object]] = []
+    feature_and_time_cols = [
+        *source_r_cols("exact"),
+        "exact_time_ms",
+        *source_r_cols("sampled"),
+        "sampled_time_ms",
+    ]
+
+    for split_name in ["train", "sparse", "rmat"]:
+        merbit_df = getattr(bundles["merbit"], split_name)
+        csr_df = getattr(bundles["csr"], split_name)
+
+        left = merbit_df[["graph_id", "base_graph", *feature_and_time_cols]].copy()
+        right = csr_df[["graph_id", "base_graph", *feature_and_time_cols]].copy()
+        merged = pd.merge(
+            left,
+            right,
+            on=["graph_id", "base_graph"],
+            how="outer",
+            suffixes=("_merbit", "_csr"),
+            indicator=True,
+            validate="one_to_one",
+        )
+
+        unmatched = merged[merged["_merge"] != "both"]
+        if len(unmatched) > 0:
+            examples = unmatched[["graph_id", "_merge"]].head(10).to_dict("records")
+            raise ValueError(
+                f"[{split_name}] MERBIT/CSR graph IDs do not align. Examples: {examples}"
+            )
+
+        max_diff = 0.0
+        per_column_max: Dict[str, float] = {}
+        for column in feature_and_time_cols:
+            a = merged[f"{column}_merbit"].to_numpy(dtype=float)
+            b = merged[f"{column}_csr"].to_numpy(dtype=float)
+            diff = np.abs(a - b)
+            column_max = float(np.max(diff)) if len(diff) else 0.0
+            per_column_max[column] = column_max
+            max_diff = max(max_diff, column_max)
+
+        rows.append(
+            {
+                "split": split_name,
+                "rows": int(len(merged)),
+                "max_abs_feature_or_time_difference": max_diff,
+                **{f"max_abs_diff_{key}": value for key, value in per_column_max.items()},
+            }
+        )
+
+        if max_diff > atol:
+            raise ValueError(
+                f"[{split_name}] backend-independent RD data differ between MERBIT "
+                f"and CSR: max absolute difference={max_diff:.12g} > {atol:.12g}"
+            )
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(out_dir / "cross_kernel_feature_consistency.csv", index=False)
+    return summary
+
+
+def common_suite_sparse_graphs(
+    bundles: Mapping[str, KernelBundle],
+) -> List[str]:
+    graph_sets: List[set[str]] = []
+    for bundle in bundles.values():
+        graph_sets.append(set(bundle.train["base_graph"].astype(str)))
+        graph_sets.append(set(bundle.sparse["base_graph"].astype(str)))
+
+    common = set.intersection(*graph_sets) if graph_sets else set()
+    if not common:
+        raise ValueError("No common SuiteSparse graphs across selected datasets")
+
+    for kernel, bundle in bundles.items():
+        train_set = set(bundle.train["base_graph"].astype(str))
+        sparse_set = set(bundle.sparse["base_graph"].astype(str))
+        if train_set != common or sparse_set != common:
+            raise ValueError(
+                f"[{kernel}] graph sets differ from the common set: "
+                f"train={len(train_set)}, sparse={len(sparse_set)}, common={len(common)}"
+            )
+
+    return sorted(common, key=natural_graph_key)
+
+
+def compare_backend_prediction_frames(
+    merbit_df: pd.DataFrame,
+    csr_df: pd.DataFrame,
+    feature_variant: str,
+    experiment: str,
+    out_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compare targets and predictions for the same graphs under MERBIT and CSR."""
+    keys = ["graph_id", "base_graph"]
+    if "fold" in merbit_df.columns and "fold" in csr_df.columns:
+        keys.append("fold")
+
+    selected = [*keys, "speedup", "pred_speedup", "pred_log_speedup"]
+    merbit_part = merbit_df[selected].rename(
+        columns={
+            "speedup": "true_speedup_merbit",
+            "pred_speedup": "pred_speedup_merbit",
+            "pred_log_speedup": "pred_log_speedup_merbit",
+        }
+    )
+    csr_part = csr_df[selected].rename(
+        columns={
+            "speedup": "true_speedup_csr",
+            "pred_speedup": "pred_speedup_csr",
+            "pred_log_speedup": "pred_log_speedup_csr",
+        }
+    )
+    paired = pd.merge(
+        merbit_part,
+        csr_part,
+        on=keys,
+        how="inner",
+        validate="one_to_one",
+    )
+    if len(paired) != len(merbit_df) or len(paired) != len(csr_df):
+        raise RuntimeError(
+            f"[{feature_variant}/{experiment}] MERBIT/CSR prediction alignment failed: "
+            f"merbit={len(merbit_df)}, csr={len(csr_df)}, merged={len(paired)}"
+        )
+
+    paired["feature_variant"] = feature_variant
+    paired["experiment"] = experiment
+    paired["actual_beneficial_merbit"] = paired["true_speedup_merbit"] > 1.0
+    paired["actual_beneficial_csr"] = paired["true_speedup_csr"] > 1.0
+    paired["actual_backend_disagreement"] = (
+        paired["actual_beneficial_merbit"] != paired["actual_beneficial_csr"]
+    )
+    for tau_h in sorted({pair[1] for pair in BAND_GATE_PAIRS}):
+        paired[f"pred_select_merbit_tau_{tau_h:.2f}"] = (
+            paired["pred_speedup_merbit"] >= tau_h
+        )
+        paired[f"pred_select_csr_tau_{tau_h:.2f}"] = (
+            paired["pred_speedup_csr"] >= tau_h
+        )
+
+    paired.to_csv(
+        out_dir / f"{feature_variant}_{experiment}_merbit_vs_csr_predictions.csv",
+        index=False,
+    )
+
+    true_m = paired["true_speedup_merbit"].to_numpy(dtype=float)
+    true_c = paired["true_speedup_csr"].to_numpy(dtype=float)
+    pred_m = paired["pred_speedup_merbit"].to_numpy(dtype=float)
+    pred_c = paired["pred_speedup_csr"].to_numpy(dtype=float)
+
+    summary_row: Dict[str, object] = {
+        "feature_variant": feature_variant,
+        "experiment": experiment,
+        "rows": int(len(paired)),
+        "mean_true_speedup_merbit": float(np.mean(true_m)),
+        "mean_true_speedup_csr": float(np.mean(true_c)),
+        "median_true_speedup_merbit": float(np.median(true_m)),
+        "median_true_speedup_csr": float(np.median(true_c)),
+        "spearman_true_merbit_vs_csr": spearman_corr(true_m, true_c),
+        "pearson_log_true_merbit_vs_csr": pearson_corr(np.log(true_m), np.log(true_c)),
+        "spearman_pred_merbit_vs_csr": spearman_corr(pred_m, pred_c),
+        "beneficial_count_merbit": int(np.sum(true_m > 1.0)),
+        "beneficial_count_csr": int(np.sum(true_c > 1.0)),
+        "actual_backend_disagreement_count": int(
+            paired["actual_backend_disagreement"].sum()
+        ),
+        "actual_backend_disagreement_rate": float(
+            paired["actual_backend_disagreement"].mean()
+        ),
     }
 
+    for tau_h in sorted({pair[1] for pair in BAND_GATE_PAIRS}):
+        merbit_select = pred_m >= tau_h
+        csr_select = pred_c >= tau_h
+        summary_row[f"gate_disagreement_rate_tau_{tau_h:.2f}"] = float(
+            np.mean(merbit_select != csr_select)
+        )
+
+    summary = pd.DataFrame([summary_row])
+    summary.to_csv(
+        out_dir / f"{feature_variant}_{experiment}_merbit_vs_csr_summary.csv",
+        index=False,
+    )
+    return paired, summary
 
 
-def build_cross_kernel_outputs(results: Dict[str, Dict[str, pd.DataFrame]], out_dir: Path) -> None:
-    summary_parts = []
-    stats_parts = []
-    band_parts = []
-    gate_parts = []
-    coef_parts = []
-    heldout_pred_parts = []
+def run_backend_sensitivity_analysis(
+    kernel_results: Mapping[str, KernelResult],
+    out_dir: Path,
+) -> pd.DataFrame:
+    if not {"merbit", "csr"}.issubset(kernel_results):
+        return pd.DataFrame()
 
-    for kernel, dfs in results.items():
-        summary_parts.append(dfs["master"])
-        stats_parts.append(dfs["stats"])
-        band_parts.append(dfs["band_gate"])
-        gate_parts.append(dfs["conservative_gate"])
-        coef_parts.append(dfs["coef"])
-        heldout_pred_parts.append(dfs["pred_heldout"])
+    summaries: List[pd.DataFrame] = []
+    for variant in FEATURE_VARIANTS:
+        merbit_result = kernel_results["merbit"].variants[variant]
+        csr_result = kernel_results["csr"].variants[variant]
+        for experiment in merbit_result.predictions:
+            _, summary = compare_backend_prediction_frames(
+                merbit_result.predictions[experiment],
+                csr_result.predictions[experiment],
+                variant,
+                experiment,
+                out_dir,
+            )
+            summaries.append(summary)
 
-    all_master = pd.concat(summary_parts, ignore_index=True)
-    all_stats = pd.concat(stats_parts, ignore_index=True)
-    all_band = pd.concat(band_parts, ignore_index=True)
-    all_gate = pd.concat(gate_parts, ignore_index=True)
-    all_coef = pd.concat(coef_parts, ignore_index=True)
-    all_heldout_pred = pd.concat(heldout_pred_parts, ignore_index=True)
+    all_summary = pd.concat(summaries, ignore_index=True)
+    all_summary.to_csv(out_dir / "all_backend_sensitivity_summary.csv", index=False)
+    return all_summary
 
-    all_master.to_csv(out_dir / "all_kernels_master_summary.csv", index=False)
-    all_stats.to_csv(out_dir / "all_kernels_dataset_stats.csv", index=False)
-    all_band.to_csv(out_dir / "all_kernels_band_gate.csv", index=False)
-    all_gate.to_csv(out_dir / "all_kernels_conservative_gate.csv", index=False)
-    all_coef.to_csv(out_dir / "all_kernels_coefficients_expB_same_graph.csv", index=False)
-    all_heldout_pred.to_csv(out_dir / "all_kernels_heldout_graph_oof_predictions.csv", index=False)
 
-    # Pairwise comparison on the original test graphs when both kernels are available.
-    # This keeps the old same-graph predictions for compatibility.
-    if "merbit" in results and "csr" in results:
-        m = results["merbit"]["pred"][[
-            "graph_id", "base_graph", "speedup", "pred_speedup", "abs_err_speedup", "ape"
-        ]].rename(columns={
-            "speedup": "true_speedup_merbit",
-            "pred_speedup": "pred_speedup_merbit",
-            "abs_err_speedup": "abs_err_speedup_merbit",
-            "ape": "ape_merbit",
-        })
-        c = results["csr"]["pred"][[
-            "graph_id", "base_graph", "speedup", "pred_speedup", "abs_err_speedup", "ape"
-        ]].rename(columns={
-            "speedup": "true_speedup_csr",
-            "pred_speedup": "pred_speedup_csr",
-            "abs_err_speedup": "abs_err_speedup_csr",
-            "ape": "ape_csr",
-        })
-        cmp_df = pd.merge(m, c, on=["graph_id", "base_graph"], how="inner")
-        cmp_df["true_speedup_merbit_minus_csr"] = cmp_df["true_speedup_merbit"] - cmp_df["true_speedup_csr"]
-        cmp_df["pred_speedup_merbit_minus_csr"] = cmp_df["pred_speedup_merbit"] - cmp_df["pred_speedup_csr"]
-        cmp_df["merbit_true_better_than_csr"] = cmp_df["true_speedup_merbit"] > cmp_df["true_speedup_csr"]
-        cmp_df.to_csv(out_dir / "test_original_same_graph_merbit_vs_csr_predictions.csv", index=False)
+def run_kernel_pipeline(
+    bundle: KernelBundle,
+    graph_folds: Sequence[GraphFold],
+    ridge_alpha: float,
+    expected_augmented_per_graph: Optional[int],
+    root_out_dir: Path,
+) -> KernelResult:
+    kernel_dir = ensure_directory(root_out_dir / bundle.kernel)
+    comparison_dir = ensure_directory(kernel_dir / "comparison")
+    diagnostics_dir = ensure_directory(kernel_dir / "cross_feature_diagnostics")
 
-        cmp_summary = pd.DataFrame([{
-            "num_common_graphs": int(len(cmp_df)),
-            "mean_true_speedup_merbit": float(cmp_df["true_speedup_merbit"].mean()),
-            "mean_true_speedup_csr": float(cmp_df["true_speedup_csr"].mean()),
-            "median_true_speedup_merbit": float(cmp_df["true_speedup_merbit"].median()),
-            "median_true_speedup_csr": float(cmp_df["true_speedup_csr"].median()),
-            "mean_pred_speedup_merbit": float(cmp_df["pred_speedup_merbit"].mean()),
-            "mean_pred_speedup_csr": float(cmp_df["pred_speedup_csr"].mean()),
-            "num_merbit_true_better_than_csr": int(cmp_df["merbit_true_better_than_csr"].sum()),
-            "mean_true_speedup_merbit_minus_csr": float(cmp_df["true_speedup_merbit_minus_csr"].mean()),
-            "mean_pred_speedup_merbit_minus_csr": float(cmp_df["pred_speedup_merbit_minus_csr"].mean()),
-        }])
-        cmp_summary.to_csv(out_dir / "test_original_same_graph_merbit_vs_csr_summary.csv", index=False)
+    validate_group_structure(
+        bundle.train,
+        bundle.sparse,
+        expected_augmented_per_graph,
+        kernel_dir,
+    )
 
-        # Pairwise comparison for leakage-free held-out predictions.
-        mh = results["merbit"]["pred_heldout"][[
-            "graph_id", "base_graph", "fold", "speedup", "pred_speedup", "abs_err_speedup", "ape"
-        ]].rename(columns={
-            "fold": "fold_merbit",
-            "speedup": "true_speedup_merbit",
-            "pred_speedup": "pred_speedup_merbit",
-            "abs_err_speedup": "abs_err_speedup_merbit",
-            "ape": "ape_merbit",
-        })
-        ch = results["csr"]["pred_heldout"][[
-            "graph_id", "base_graph", "fold", "speedup", "pred_speedup", "abs_err_speedup", "ape"
-        ]].rename(columns={
-            "fold": "fold_csr",
-            "speedup": "true_speedup_csr",
-            "pred_speedup": "pred_speedup_csr",
-            "abs_err_speedup": "abs_err_speedup_csr",
-            "ape": "ape_csr",
-        })
-        cmp_h_df = pd.merge(mh, ch, on=["graph_id", "base_graph"], how="inner")
-        cmp_h_df["true_speedup_merbit_minus_csr"] = cmp_h_df["true_speedup_merbit"] - cmp_h_df["true_speedup_csr"]
-        cmp_h_df["pred_speedup_merbit_minus_csr"] = cmp_h_df["pred_speedup_merbit"] - cmp_h_df["pred_speedup_csr"]
-        cmp_h_df["merbit_true_better_than_csr"] = cmp_h_df["true_speedup_merbit"] > cmp_h_df["true_speedup_csr"]
-        cmp_h_df.to_csv(out_dir / "heldout_graph_merbit_vs_csr_oof_predictions.csv", index=False)
+    results: Dict[str, VariantResult] = {}
+    for variant in FEATURE_VARIANTS:
+        print(
+            f"\n==================== {bundle.kernel.upper()} / "
+            f"{variant.upper()} FEATURES ===================="
+        )
+        results[variant] = run_variant(
+            bundle.kernel,
+            variant,
+            bundle.train,
+            bundle.sparse,
+            bundle.rmat,
+            graph_folds,
+            ridge_alpha,
+            kernel_dir,
+        )
 
-    print("\n==================== ALL KERNELS MASTER SUMMARY ====================")
-    print(all_master.to_string(index=False))
+    metric_comparison = compare_variants(
+        results["exact"], results["sampled"], comparison_dir
+    )
+    cross_feature_summary = run_cross_feature_diagnostics(
+        results["exact"],
+        results["sampled"],
+        bundle.sparse,
+        bundle.rmat,
+        diagnostics_dir,
+    )
 
+    all_master = pd.concat(
+        [results[variant].master_summary for variant in FEATURE_VARIANTS],
+        ignore_index=True,
+    )
+    all_master.to_csv(kernel_dir / "all_variants_master_summary.csv", index=False)
+
+    all_coefficients = pd.concat(
+        [results[variant].coefficient_table for variant in FEATURE_VARIANTS],
+        ignore_index=True,
+    )
+    all_coefficients.to_csv(
+        kernel_dir / "all_variants_deploy_model_parameters.csv", index=False
+    )
+
+    return KernelResult(
+        kernel=bundle.kernel,
+        variants=results,
+        metric_comparison=metric_comparison,
+        cross_feature_summary=cross_feature_summary,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate RD-based predictor for MERBIT and CSR target SpMV kernels.")
-    parser.add_argument("--data-dir", type=Path, default=Path("."), help="Directory containing input CSV files.")
-    parser.add_argument("--out-dir", type=Path, default=Path("predictor_eval_merbit_csr_outputs"), help="Directory for output CSV files.")
-    parser.add_argument("--ridge-alpha", type=float, default=RIDGE_ALPHA, help="Ridge alpha value.")
-    parser.add_argument("--cv-folds", type=int, default=CV_FOLDS, help="Number of GroupKFold splits.")
-    parser.add_argument("--config-json", type=Path, default=None, help="Optional JSON config mapping kernel to train_csv/test_csv.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate exact vs sampled RD predictors for MERBIT and CSR using "
+            "shared graph folds."
+        )
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Directory containing the six default CSV files.",
+    )
+    parser.add_argument(
+        "--kernels",
+        nargs="+",
+        choices=SUPPORTED_KERNELS,
+        default=list(SUPPORTED_KERNELS),
+        help="Backends to evaluate. Default: merbit csr.",
+    )
+
+    parser.add_argument("--train-merbit-csv", type=Path, default=None)
+    parser.add_argument("--sparse-test-merbit-csv", type=Path, default=None)
+    parser.add_argument("--rmat-test-merbit-csv", type=Path, default=None)
+    parser.add_argument("--train-csr-csv", type=Path, default=None)
+    parser.add_argument("--sparse-test-csr-csv", type=Path, default=None)
+    parser.add_argument("--rmat-test-csr-csv", type=Path, default=None)
+
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("predictor_eval_exact_sampled_dual_backend_outputs"),
+        help="Output directory.",
+    )
+    parser.add_argument("--ridge-alpha", type=float, default=RIDGE_ALPHA)
+    parser.add_argument("--cv-folds", type=int, default=CV_FOLDS)
+    parser.add_argument(
+        "--expected-augmented-per-graph",
+        type=int,
+        default=9,
+        help="Set to 0 to disable the group-size assertion.",
+    )
+    parser.add_argument(
+        "--cross-kernel-feature-tol",
+        type=float,
+        default=1e-12,
+        help=(
+            "Maximum allowed difference between backend-independent RD fields "
+            "in corresponding MERBIT and CSR files."
+        ),
+    )
     return parser.parse_args()
-
-
 
 def main() -> None:
     args = parse_args()
+    if args.ridge_alpha < 0.0:
+        raise ValueError("ridge-alpha must be non-negative")
+    if args.cv_folds < 2:
+        raise ValueError("cv-folds must be at least 2")
+    if args.cross_kernel_feature_tol < 0.0:
+        raise ValueError("cross-kernel-feature-tol must be non-negative")
 
-    global RIDGE_ALPHA, CV_FOLDS
-    RIDGE_ALPHA = args.ridge_alpha
-    CV_FOLDS = args.cv_folds
-
+    selected_kernels = list(dict.fromkeys(args.kernels))
     data_dir = args.data_dir.resolve()
-    out_dir = args.out_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_directory(args.out_dir.resolve())
+    feature_dir = ensure_directory(out_dir / "feature_analysis")
+    backend_dir = ensure_directory(out_dir / "backend_sensitivity")
 
-    if args.config_json is not None:
-        datasets = json.loads(args.config_json.read_text(encoding="utf-8"))
-    else:
-        datasets = DEFAULT_DATASETS
+    override_map: Dict[str, Dict[str, Optional[Path]]] = {
+        "merbit": {
+            "train": args.train_merbit_csv,
+            "sparse": args.sparse_test_merbit_csv,
+            "rmat": args.rmat_test_merbit_csv,
+        },
+        "csr": {
+            "train": args.train_csr_csv,
+            "sparse": args.sparse_test_csr_csv,
+            "rmat": args.rmat_test_csr_csv,
+        },
+    }
 
-    print(f"Data dir: {data_dir}")
-    print(f"Output dir: {out_dir}")
-    print(f"Ridge alpha: {RIDGE_ALPHA}")
-    print(f"CV folds: {CV_FOLDS}")
+    resolved_paths: Dict[str, Dict[str, Path]] = {}
+    bundles: Dict[str, KernelBundle] = {}
+    for kernel in selected_kernels:
+        resolved_paths[kernel] = {}
+        for split_name, default_name in DEFAULT_DATA_FILES[kernel].items():
+            resolved_paths[kernel][split_name] = resolve_dataset_path(
+                data_dir,
+                override_map[kernel][split_name],
+                default_name,
+            )
 
-    results: Dict[str, Dict[str, pd.DataFrame]] = {}
-    for kernel, cfg in datasets.items():
-        train_csv = data_dir / cfg["train_csv"]
-        test_csv = data_dir / cfg["test_csv"]
-        if not train_csv.exists():
-            raise FileNotFoundError(f"Missing train CSV for {kernel}: {train_csv}")
-        if not test_csv.exists():
-            raise FileNotFoundError(f"Missing test CSV for {kernel}: {test_csv}")
-        results[kernel] = run_one_kernel(kernel, train_csv, test_csv, out_dir)
+        bundles[kernel] = load_kernel_bundle(
+            kernel,
+            resolved_paths[kernel]["train"],
+            resolved_paths[kernel]["sparse"],
+            resolved_paths[kernel]["rmat"],
+        )
 
-    build_cross_kernel_outputs(results, out_dir)
+    validate_cross_kernel_feature_consistency(
+        bundles,
+        out_dir,
+        atol=args.cross_kernel_feature_tol,
+    )
+
+    all_dataset_frames: List[pd.DataFrame] = []
+    for bundle in bundles.values():
+        all_dataset_frames.extend([bundle.train, bundle.sparse, bundle.rmat])
+
+    all_dataset_summaries = pd.concat(
+        [dataset_summary(frame) for frame in all_dataset_frames],
+        ignore_index=True,
+    )
+    all_dataset_summaries.to_csv(
+        out_dir / "all_kernels_dataset_summaries.csv", index=False
+    )
+
+    # Exact/sample RD features are backend-independent. After consistency
+    # validation, analyze them once using the first selected backend.
+    reference_bundle = bundles[selected_kernels[0]]
+    feature_summaries: List[pd.DataFrame] = []
+    feature_per_bins: List[pd.DataFrame] = []
+    for frame in [reference_bundle.train, reference_bundle.sparse, reference_bundle.rmat]:
+        analysis = analyze_feature_approximation(frame, feature_dir)
+        feature_summaries.append(analysis["summary"])
+        feature_per_bins.append(analysis["per_bin"])
+    pd.concat(feature_summaries, ignore_index=True).to_csv(
+        feature_dir / "all_datasets_feature_approximation_summary.csv", index=False
+    )
+    pd.concat(feature_per_bins, ignore_index=True).to_csv(
+        feature_dir / "all_datasets_feature_approximation_per_bin.csv", index=False
+    )
+
+    shared_graphs = common_suite_sparse_graphs(bundles)
+    graph_folds = build_graph_folds(shared_graphs, args.cv_folds)
+    save_graph_folds(graph_folds, out_dir / "shared_suite_sparse_graph_folds.csv")
+
+    kernel_results: Dict[str, KernelResult] = {}
+    for kernel in selected_kernels:
+        kernel_results[kernel] = run_kernel_pipeline(
+            bundles[kernel],
+            graph_folds,
+            args.ridge_alpha,
+            args.expected_augmented_per_graph or None,
+            out_dir,
+        )
+
+    backend_summary = run_backend_sensitivity_analysis(kernel_results, backend_dir)
+
+    all_master = pd.concat(
+        [
+            result.variants[variant].master_summary
+            for result in kernel_results.values()
+            for variant in FEATURE_VARIANTS
+        ],
+        ignore_index=True,
+    )
+    all_master.to_csv(out_dir / "all_kernels_master_summary.csv", index=False)
+
+    all_metric_comparison = pd.concat(
+        [result.metric_comparison for result in kernel_results.values()],
+        ignore_index=True,
+    )
+    all_metric_comparison.to_csv(
+        out_dir / "all_kernels_exact_vs_sampled_metric_comparison.csv",
+        index=False,
+    )
+
+    all_cross_feature = pd.concat(
+        [result.cross_feature_summary for result in kernel_results.values()],
+        ignore_index=True,
+    )
+    all_cross_feature.to_csv(
+        out_dir / "all_kernels_cross_feature_compatibility_summary.csv",
+        index=False,
+    )
+
+    all_coefficients = pd.concat(
+        [
+            result.variants[variant].coefficient_table
+            for result in kernel_results.values()
+            for variant in FEATURE_VARIANTS
+        ],
+        ignore_index=True,
+    )
+    all_coefficients.to_csv(
+        out_dir / "all_kernels_deploy_model_parameters.csv", index=False
+    )
+
+    run_metadata = {
+        "data_dir": str(data_dir),
+        "selected_kernels": selected_kernels,
+        "input_files": {
+            kernel: {
+                split_name: str(path)
+                for split_name, path in paths.items()
+            }
+            for kernel, paths in resolved_paths.items()
+        },
+        "out_dir": str(out_dir),
+        "ridge_alpha": float(args.ridge_alpha),
+        "cv_folds": int(args.cv_folds),
+        "feature_variants": list(FEATURE_VARIANTS),
+        "feature_count": FEATURE_COUNT,
+        "band_gate_pairs": BAND_GATE_PAIRS,
+        "expected_augmented_per_graph": int(args.expected_augmented_per_graph),
+        "cross_kernel_feature_tolerance": float(args.cross_kernel_feature_tol),
+        "random_seed_reserved": RANDOM_SEED,
+    }
+    write_json(out_dir / "run_metadata.json", run_metadata)
+
+    print("\n==================== ALL-KERNEL MASTER SUMMARY ====================")
+    print(all_master.to_string(index=False))
+    print("\n==================== EXACT VS SAMPLED DELTAS ====================")
+    print(all_metric_comparison.to_string(index=False))
+    print("\n==================== CROSS-FEATURE DIAGNOSTIC ====================")
+    print(all_cross_feature.to_string(index=False))
+    if len(backend_summary) > 0:
+        print("\n==================== MERBIT VS CSR SENSITIVITY ====================")
+        print(backend_summary.to_string(index=False))
+
     print(f"\nDone. Outputs written to: {out_dir}")
+    for kernel in selected_kernels:
+        print(
+            f"Primary {kernel.upper()} deployment header: "
+            f"{out_dir / kernel / 'sampled' / f'rd_sampled_{kernel}_model.hpp'}"
+        )
 
 
 if __name__ == "__main__":

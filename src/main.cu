@@ -24,23 +24,23 @@ int main(int argc, char* argv[])
     //读取图
     BASEGRAPH<ValueType> basegraph(env, gid);
     
-    PARA  para[9] = {{0.10, 64, 256}, {0.10, 256, 1024}, {0.20, 1024, 4096}, 
-                     {0.30, 4096, 16384}, {0.30, 16384, 65536}, {0.40, 65536, 262144}, 
-                     {0.50, 262144, 1048576}, {0.70, 1048576, 4194304}, {0.90, 0, 10000000}};
-    for (int i=0; i<9; ++i)
-    {
-        GRAPH<ValueType> graph(env, basegraph, para[i].rho, para[i].near, para[i].window);
-        //GRAPH<ValueType> graph(env, basegraph, 0, 0, 0);
+    //PARA  para[9] = {{0.10, 64, 256}, {0.10, 256, 1024}, {0.20, 1024, 4096}, 
+    //                 {0.30, 4096, 16384}, {0.30, 16384, 65536}, {0.40, 65536, 262144}, 
+    //                 {0.50, 262144, 1048576}, {0.70, 1048576, 4194304}, {0.90, 0, 10000000}};
+    //for (int i=0; i<9; ++i)
+    //{
+        //GRAPH<ValueType> graph(env, basegraph, para[i].rho, para[i].near, para[i].window);
+        GRAPH<ValueType> graph(env, basegraph, 0, 0, 0);
 
         //graph.desc("/home/ta/zhangq388/RELABEL/desc1.txt");
         //graph.show();
         //graph.visual("/home/ta/zhangq388/RELABEL/matrix.jpg");
         //graph.jaccard(env, 1, 2);
         
-        std::cout << "graph_id = " << graph.graph_id << ", rho = " << para[i].rho << ", near = " << para[i].near << ", window = " << para[i].window << ", type = " << type;
-        FSTR << graph.graph_id << "_" << para[i].rho << "_" << para[i].near << "_" << para[i].window;
-        //std::cout << "graph_id = " << graph.graph_id << ", type = " << type;
-        //FSTR << graph.graph_id;
+        //std::cout << "graph_id = " << graph.graph_id << ", rho = " << para[i].rho << ", near = " << para[i].near << ", window = " << para[i].window << ", type = " << type;
+        //FSTR << graph.graph_id << "_" << para[i].rho << "_" << para[i].near << "_" << para[i].window;
+        std::cout << "graph_id = " << graph.graph_id << ", type = " << type;
+        FSTR << graph.graph_id;
         
         if (type == "origin")
         {
@@ -122,8 +122,8 @@ int main(int argc, char* argv[])
         else if (type == "gorder6")
         {
             //graph.gorder6(env, std::stoi(argv[3]));
-            graph.gorder6(env, graph.get_width());
             graph.locality_predict(env, speedup);
+            graph.gorder6(env, graph.get_width());
             //graph.show();
             //graph.visual("./matrix3.jpg");
         }
@@ -135,17 +135,10 @@ int main(int argc, char* argv[])
         
         //graph.relabel_slashburn(env); //不用这种方法对比：(1)该算法目标为压缩；(2)代码构造图时nrow=max(el)，对不上；
         //graph.show();
-        timer.Start();
-        graph.sampled_hll_rd_block_gpu(env, 40960, 32, 589824, 12, 0, 1);
-        timer.Stop();
-        tim2 = timer.Millisecs();
-        std::cout << ", tim2 = " << tim2;
-        //graph.row_length_stats(32);
-        //graph.row_length_stats(128);
-        //graph.row_length_stats(512);
+
         //spmv测试
-        graph.spmv(env, "csr");
-    }
+        graph.spmv(env, "merbit");
+    //}
     
     FSTR.close();
 

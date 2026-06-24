@@ -855,141 +855,88 @@ int GRAPH<ValueType>::gscore(const ENV& _env,
     return score;
 }
 
-template<typename ValueType>
-void GRAPH<ValueType>::row_length_stats(int window)
+
+
+
+
+
+//大尺度reuse-distance
+struct Fenwick 
 {
-    /*
-     * Important:
-     * In your current implementation, col_ind is used as the COO row-index array
-     * when calling cusparseXcoo2csr().
-     *
-     * Therefore:
-     *     row_nnz[row] = count(col_ind == row)
-     */
-    std::vector<int> h_rows(nnz);
-
-    cudaError_t err = cudaMemcpy(h_rows.data(), col_ind, sizeof(int) * nnz, cudaMemcpyDeviceToHost);
-
-    if (err != cudaSuccess)
+    int              n;
+    std::vector<int> bit;
+    explicit Fenwick(int n_) : n(n_), bit(n_ + 1, 0) {};
+    inline void add(int idx, int delta) 
     {
-        std::cerr << "[window_workload_stats] cudaMemcpy failed: "
-                  << cudaGetErrorString(err) << "\n";
-        return;
+        for (int i = idx + 1; i <= n; i += i & -i) bit[i] += delta;
+    };
+    inline long long sum(int idx) const 
+    {
+        long long s = 0;
+        for (int i = idx + 1; i > 0; i -= i & -i) s += bit[i];
+        return s;
+    };
+    inline long long range_sum(int l, int r) const 
+    {
+        if (r < l) return 0;
+        if (l <= 0) return sum(r);
+        return sum(r) - sum(l - 1);
     }
+};
 
-    // ------------------------------------------------------------
-    // Step 1. Count nnz per row.
-    // ------------------------------------------------------------
-    std::vector<int> row_nnz(nrow, 0);
-    int invalid_count = 0;
+inline int bin_id(const double rd, const std::vector<int>& bin_edges)
+{
+    return static_cast<int>(std::upper_bound(bin_edges.begin(), bin_edges.end(), rd) - bin_edges.begin());
+}
+
+void compute_sector_rd_histogram(const int*               col_ind,
+                                 const int                nrow,
+                                 const int                nnz,
+                                 const int                sector_size,
+                                 const std::vector<int>&  bin_edges,
+                                 std::vector<double>&     bin_prob_out)
+{
+    const int num_sectors = (nrow + sector_size - 1) / sector_size;
+    std::vector<int> last_pos(num_sectors, -1);
+    Fenwick bit(nnz);
+
+    const int num_bins = static_cast<int>(bin_edges.size()) + 1;
+    std::vector<long long> bin_counts(num_bins, 0);
+    long long valid_reuse = 0;
 
     for (int k = 0; k < nnz; ++k)
     {
-        int r = h_rows[k];
+        const int sector = col_ind[k] / sector_size;
+        const int old = last_pos[sector];
 
-        if (r >= 0 && r < nrow)
+        if (old < 0)
         {
-            row_nnz[r]++;
+            bit.add(k, 1);
+            last_pos[sector] = k;
+            continue;
         }
-        else
-        {
-            invalid_count++;
-        }
+
+        bit.add(old, -1);
+        const long long rd = bit.range_sum(old + 1, k - 1);
+        ++bin_counts[bin_id(static_cast<double>(rd), bin_edges)];
+        ++valid_reuse;
+
+        bit.add(k, 1);
+        last_pos[sector] = k;
     }
 
-    // ------------------------------------------------------------
-    // Step 2. Compute window workload.
-    // window_nnz[w] = total nnz in rows [w*window, (w+1)*window)
-    // ------------------------------------------------------------
-    int num_windows = (nrow + window - 1) / window;
-    std::vector<long long> window_nnz(num_windows, 0);
-
-    for (int w = 0; w < num_windows; ++w)
+    bin_prob_out.assign(num_bins, 0.0);
+    if (valid_reuse > 0)
     {
-        int start = w * window;
-        int end = std::min(start + window, nrow);
-
-        long long sum = 0;
-
-        for (int r = start; r < end; ++r)
+        for (int i = 0; i < num_bins; ++i)
         {
-            sum += row_nnz[r];
-        }
-
-        window_nnz[w] = sum;
-    }
-
-    // ------------------------------------------------------------
-    // Step 3. Window-level statistics.
-    // ------------------------------------------------------------
-    double window_mean = static_cast<double>(nnz) / static_cast<double>(num_windows);
-
-    double window_var = 0.0;
-    double window_std = 0.0;
-    double window_cv = 0.0;
-
-    long long window_min = window_nnz.empty() ? 0 : window_nnz[0];
-    long long window_max = 0;
-    int window_max_id = 0;
-
-    for (int w = 0; w < num_windows; ++w)
-    {
-        long long x = window_nnz[w];
-
-        double diff = static_cast<double>(x) - window_mean;
-        window_var += diff * diff;
-
-        if (x < window_min)
-        {
-            window_min = x;
-        }
-
-        if (x > window_max)
-        {
-            window_max = x;
-            window_max_id = w;
+            bin_prob_out[i] = static_cast<double>(bin_counts[i]) / static_cast<double>(valid_reuse);
         }
     }
-
-    window_var /= static_cast<double>(num_windows);
-    window_std = std::sqrt(window_var);
-    window_cv = (window_mean > 0.0) ? window_std / window_mean : 0.0;
-
-    // ------------------------------------------------------------
-    // Step 4. Top-5 window workload.
-    // ------------------------------------------------------------
-    std::vector<long long> sorted_window = window_nnz;
-    std::sort(sorted_window.begin(), sorted_window.end(), std::greater<long long>());
-
-    long long top1_window_nnz = sorted_window.empty() ? 0 : sorted_window[0];
-
-    long long top5_window_nnz_sum = 0;
-    int top5_count = std::min(5, static_cast<int>(sorted_window.size()));
-
-    for (int i = 0; i < top5_count; ++i)
-    {
-        top5_window_nnz_sum += sorted_window[i];
-    }
-
-    int top1_start_row = window_max_id * window;
-    int top1_end_row = std::min(top1_start_row + window, nrow) - 1;
-
-    // ------------------------------------------------------------
-    // Step 5. Print only window-level workload imbalance.
-    // ------------------------------------------------------------
-    std::cout << "\n========== Window-level Workload Imbalance ==========\n";
-    std::cout << "graph_id              : " << graph_id << "\n";
-    std::cout << "window                : " << window << "\n";
-
-    std::cout << "\n[Window statistics]\n";
-    std::cout << "window_var            : " << std::setprecision(10) << window_var << "\n";
-    std::cout << "window_std            : " << std::setprecision(10) << window_std << "\n";
-    std::cout << "window_cv             : " << std::setprecision(10) << window_cv << "\n";
-    std::cout << "window_min            : " << window_min << "\n";
-    std::cout << "window_max            : " << window_max << "\n";
-
-    std::cout << "=====================================================\n\n";
 }
+
+
+
 
 
 
@@ -1183,483 +1130,199 @@ __global__ void sampled_hll_rd_block_kernel(const int* __restrict__ indice,
     }
 }
 
-template<typename ValueType>
-void GRAPH<ValueType>::sampled_hll_rd_block_gpu(const ENV& _env,
-                                                const int  samples,
-                                                const int  sector_size,
-                                                const int  rd_cap,
-                                                const int  hll_p_in,
-                                                const int  max_scan,
-                                                const int  stream_type)
+void sampled_hll_rd_block_gpu(const ENV&               _env,
+                              const int                graph_id,
+                              const int*               row_ind,
+                              const int                nnz,
+                              const int                samples,
+                              const int                sector_size,
+                              const int                rd_cap,
+                              const int                hll_p_in,
+                              const int                max_scan,
+                              const int                stream_type,
+                              const std::vector<int>&  bin_edges,
+                              std::vector<double>&     bin_prob_out)
 {
+    const int num_bins = static_cast<int>(bin_edges.size()) + 1;
+    bin_prob_out.assign(num_bins, 0.0);
 
+    if (samples <= 0 || nnz <= 1)
+    {
+        return;
+    }
+    if (sector_size <= 0)
+    {
+        throw std::invalid_argument("sector_size must be positive");
+    }
+    if (bin_edges.empty())
+    {
+        throw std::invalid_argument("bin_edges must not be empty");
+    }
+    if (rd_cap > 0 && rd_cap < bin_edges.back())
+    {
+        throw std::invalid_argument("rd_cap must be at least the last RD bin edge; otherwise status=2 cannot be assigned to the final bin safely");
+    }
 
     int hll_p = hll_p_in;
     if (hll_p <= 0) hll_p = 12;
-    if (hll_p < 4) hll_p = 4;
-    if (hll_p > 14) hll_p = 14; // keep shared memory reasonable on GPUs with ~100KB/block
-    const int hll_m = 1 << hll_p;
-    const size_t smem_bytes = sizeof(int) * (size_t)hll_m;
+    hll_p = std::max(4, std::min(hll_p, 14));
 
-    int dev = 0;
-    CHECK_CUDA(cudaGetDevice(&dev));
+    const int hll_m = 1 << hll_p;
+    const size_t smem_bytes = sizeof(int) * static_cast<size_t>(hll_m);
+
+    // Use the device recorded by ENV instead of querying the current device.
+    const int dev = _env.device_id;
     int optin_smem = 0;
     int default_smem = 0;
-    CHECK_CUDA(cudaDeviceGetAttribute(&optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
-    CHECK_CUDA(cudaDeviceGetAttribute(&default_smem, cudaDevAttrMaxSharedMemoryPerBlock, dev));
+    cudaDeviceGetAttribute(&optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaDeviceGetAttribute(&default_smem, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+
     const int max_smem = (optin_smem > 0) ? optin_smem : default_smem;
-
-    if ((int)smem_bytes > max_smem)
+    if (static_cast<int>(smem_bytes) > max_smem)
     {
-        std::cout << "\n[rdhll] requested shared memory is too large."
-                  << "\n  hll_p      = " << hll_p
-                  << "\n  hll_m      = " << hll_m
-                  << "\n  smem_bytes = " << smem_bytes
-                  << "\n  max_smem   = " << max_smem
-                  << "\nTry hll_p=12 or hll_p=13." << std::endl;
-        return;
+        throw std::runtime_error("sampled_hll_rd_block_gpu: requested dynamic shared memory exceeds the device limit; reduce hll_p");
     }
 
-    if ((int)smem_bytes > default_smem)
+    if (static_cast<int>(smem_bytes) > default_smem)
     {
-        CHECK_CUDA(cudaFuncSetAttribute(sampled_hll_rd_block_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+        cudaFuncSetAttribute(sampled_hll_rd_block_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
     }
-
-    int* d_stream = nullptr;
-    std::string stream_name;
-    bool need_free_stream = false;
-
-    d_stream = row_ind;
 
     float* d_rd_est = nullptr;
     int* d_status = nullptr;
     int* d_pos = nullptr;
-    CHECK_CUDA(cudaMalloc((void**)&d_rd_est, sizeof(float) * samples));
-    CHECK_CUDA(cudaMalloc((void**)&d_status, sizeof(int) * samples));
-    CHECK_CUDA(cudaMalloc((void**)&d_pos, sizeof(int) * samples));
-
-    cudaEvent_t ev_start, ev_stop;
-    CHECK_CUDA(cudaEventCreate(&ev_start));
-    CHECK_CUDA(cudaEventCreate(&ev_stop));
-
-    const int block_threads = 256;
-    const int grid = samples;
-    const unsigned int seed = 246813579U + (unsigned int)graph_id * 1009U + (unsigned int)stream_type * 9176U;
-
-    CHECK_CUDA(cudaEventRecord(ev_start, _env.stream));
-    sampled_hll_rd_block_kernel<<<grid, block_threads, smem_bytes, _env.stream>>>(d_stream, nnz, samples, sector_size, seed, rd_cap, max_scan, hll_p, hll_m, d_rd_est, d_status, d_pos);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaEventRecord(ev_stop, _env.stream));
-    CHECK_CUDA(cudaEventSynchronize(ev_stop));
-
-    float kernel_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&kernel_ms, ev_start, ev_stop));
+    cudaMalloc(reinterpret_cast<void**>(&d_rd_est), sizeof(float) * samples);
+    cudaMalloc(reinterpret_cast<void**>(&d_status), sizeof(int) * samples);
+    cudaMalloc(reinterpret_cast<void**>(&d_pos), sizeof(int) * samples);
 
     std::vector<float> h_rd_est(samples);
     std::vector<int> h_status(samples);
-    CHECK_CUDA(cudaMemcpy(h_rd_est.data(), d_rd_est, sizeof(float) * samples, cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_status.data(), d_status, sizeof(int) * samples, cudaMemcpyDeviceToHost));
 
+    constexpr int block_threads = 256;
+    const int grid = samples;
+    const unsigned int seed = 246813579U + static_cast<unsigned int>(graph_id) * 1009U + static_cast<unsigned int>(stream_type) * 9176U;
+
+    // row_ind is the access stream after sort(false).
+    sampled_hll_rd_block_kernel<<<grid, block_threads, smem_bytes, _env.stream>>>(row_ind, nnz, samples, sector_size, seed, rd_cap, max_scan, hll_p, hll_m, d_rd_est, d_status, d_pos);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaMemcpyAsync(h_rd_est.data(), d_rd_est, sizeof(float) * static_cast<size_t>(samples), cudaMemcpyDeviceToHost, _env.stream));
+    CHECK_CUDA(cudaMemcpyAsync(h_status.data(), d_status, sizeof(int) * static_cast<size_t>(samples), cudaMemcpyDeviceToHost, _env.stream));
+    CHECK_CUDA(cudaStreamSynchronize(_env.stream));
+
+    std::vector<long long> bin_counts(num_bins, 0);
     int found = 0;
     int cold = 0;
     int large = 0;
-    int maxscan = 0;
-    int estimated_gt_cap = 0;
-    double sum_found = 0.0;
-    float min_found = FLT_MAX;
-    float max_found = 0.0f;
-    std::vector<float> found_values;
-    found_values.reserve(samples);
+    int unresolved = 0;
 
     for (int i = 0; i < samples; ++i)
     {
-        if (h_status[i] == 0)
+        switch (h_status[i])
         {
-            ++found;
-            sum_found += (double)h_rd_est[i];
-            min_found = std::min(min_found, h_rd_est[i]);
-            max_found = std::max(max_found, h_rd_est[i]);
-            found_values.push_back(h_rd_est[i]);
-            if (rd_cap > 0 && h_rd_est[i] > (float)rd_cap) ++estimated_gt_cap;
-        }
-        else if (h_status[i] == 1) ++cold;
-        else if (h_status[i] == 2)
-        {
-            ++large;
-            ++estimated_gt_cap;
-        }
-        else ++maxscan;
-    }
-
-    auto pct = [samples](int x) -> double 
-    {
-        return samples > 0 ? (100.0 * (double)x / (double)samples) : 0.0;
-    };
-
-    double found_mean = found > 0 ? sum_found / (double)found : 0.0;
-    std::vector<int> bin_edges = {1, 112, 512, 18432, 36864, 73728, 147456, 294912, 589824};
-    std::vector<int> bin_counts(bin_edges.size() + 1, 0);
-
-    if (!found_values.empty())
-    {
-        std::sort(found_values.begin(), found_values.end());
-        auto q = [&](double qq) -> int {
-            int id = (int)std::floor(qq * (double)(found_values.size() - 1));
-            id = std::max(0, std::min(id, (int)found_values.size() - 1));
-            return (int)std::round(found_values[id]);
-        };
-
-        for (float vf : found_values)
-        {
-            int v = (int)std::round(vf);
-            size_t b = 0;
-            while (b < bin_edges.size() && v >= bin_edges[b]) ++b;
-            ++bin_counts[b];
+            case 0:
+            {
+                ++found;
+                // Do not round the HLL estimate before applying bin boundaries.
+                const int id = bin_id(static_cast<double>(h_rd_est[i]), bin_edges);
+                ++bin_counts[id];
+                break;
+            }
+            case 1:
+                ++cold;
+                break;
+            case 2:
+                ++large;
+                ++bin_counts.back();
+                break;
+            case 3:
+                ++unresolved;
+                break;
+            default:
+                ++unresolved;
+                break;
         }
     }
-    // Early-stopped large samples belong to [rd_cap, inf). If rd_cap is 589824,
-    // this is exactly the final bin used by your current RD histogram.
-    if (rd_cap >= 589824)
+
+    // Match compute_sector_rd_histogram(): normalize only over accesses that
+    // have a previous occurrence. status=2 is also a reused access.
+    const int valid_reuse = found + large;
+    if (valid_reuse > 0)
     {
-        bin_counts.back() += large;
+        for (int i = 0; i < num_bins; ++i)
+        {
+            bin_prob_out[i] = static_cast<double>(bin_counts[i]) / static_cast<double>(valid_reuse);
+        }
     }
 
-    const float hll_rel_err = 1.04f / sqrtf((float)hll_m);
-
-    for (size_t i = 0; i < bin_counts.size(); ++i)
-    {
-        FSTR << "&" << bin_counts[i] / (double)(samples);
-    }
-
-    CHECK_CUDA(cudaEventDestroy(ev_start));
-    CHECK_CUDA(cudaEventDestroy(ev_stop));
     CUDAFREE(d_rd_est);
     CUDAFREE(d_status);
     CUDAFREE(d_pos);
-    if (need_free_stream) CUDAFREE(d_stream);
-}
-
-/*
-*jaccard
-*/
-__device__ void intersection(const int                gid,
-                             const int* __restrict__ _indice1,
-                             const int               _length1,
-                             const int* __restrict__ _indice2,
-                             const int               _length2,
-                             double&                 val)
-{
-    int i = 0, j = 0, count = 0;
-
-    while (i < _length1 && j < _length2) 
-    {
-        if (_indice1[i] < _indice2[j]) 
-        {
-            ++i; 
-        }
-        else if (_indice1[i] > _indice2[j]) 
-        {
-            ++j;
-        }
-        else 
-        {
-            ++count; 
-            ++i; 
-            ++j;
-        }
-    }
-
-    val = (count == 0)? 0 :  (count / (double)(_length1 + _length2 - count));
-}
-
-//统计源互为源的概率
-__device__ void cluster(const int* __restrict__ offset,
-                        const int* __restrict__ indice,
-                        const int               vid,
-                        double&                 val)
-{
-    const int* arr = &indice[offset[vid]];
-    int  deg = offset[vid + 1] - offset[vid];
-    double tmp = 0;
-
-    for (int i=offset[vid]; i<offset[vid+1]; ++i)
-    {
-        int cnt = 0;
-        int src = indice[i];
-
-        for (int j=offset[src]; j<offset[src+1]; ++j)
-        {
-            auto pos = cub::LowerBound(arr, deg, indice[j]);
-            cnt += (pos < deg && arr[pos] == indice[j])? 1 : 0;
-        }
-
-        tmp += (offset[src+1] == offset[src])? 0 : (cnt / (double)(offset[src+1] - offset[src] + deg - cnt));
-    }
-
-    val = (deg < 4)? 0.0 : (tmp / deg);
-}
-
-__global__ void jaccard_kernel(const int* __restrict__ offset,
-                               const int* __restrict__ indice,
-                               const int               nrow,
-                               double*                 rel)
-{
-    const int gid = blockDim.x * blockIdx.x + threadIdx.x;
-    double    val = 0.0;
-    
-    if (gid < nrow )
-    {
-        //int i = gid + 1;
-        //int j = gid;
-        //intersection(gid, &col_ind[offset[i]], offset[i+1] - offset[i], &col_ind[offset[j]], offset[j+1] - offset[j], val);
-        cluster(offset, indice, gid, val);
-        atomicAdd(rel, val);
-    }
-}
-
-template<typename ValueType> 
-void GRAPH<ValueType>::jaccard(const ENV& _env, int _id1, int _id2)
-{
-    //step 1：生成图数据
-    int*           d_offset;
-    CHECK_CUDA(cudaMalloc((void**)&d_offset, sizeof(int) * (nrow + 1)));
-    sort(true);
-    cusparseXcoo2csr(_env.handle_sparse, row_ind, nnz, nrow, d_offset, cusparseIndexBase_t::CUSPARSE_INDEX_BASE_ZERO);
-    double*        d_rel;
-    cudaMalloc((void**)&d_rel, sizeof(double));
-
-
-    //step 2：统计交集长度
-    const int block = 256;
-    const int grid = (nrow + block - 1) / block;
-    jaccard_kernel<<<grid, block>>>(d_offset, col_ind, nrow, d_rel);
-    cudaDeviceSynchronize();
-    
-    double rel = 0.0;
-    cudaMemcpy(&rel, d_rel, sizeof(double), cudaMemcpyDeviceToHost);
-    std::cout << graph_id << ", " << rel / nrow << std::endl;
-
-    CUDAFREE(d_offset);
-    CUDAFREE(d_rel);
-}
-
-/*
-*locality：包含一系列不同尺度的指标
-*/
-//小尺度workset
-template<unsigned int BLOCK, unsigned int SIGMA> __global__ 
-void score_kernel(const int* __restrict__  offset,
-                  const int* __restrict__  indice,
-                  const int                nrow,
-                  const int                nnz,
-                  int*                     d_count,
-                  int*                     d_items)
-{
-    //获取起止点
-    const int diag_start = blockIdx.x * BLOCK * SIGMA;
-    const int diag_end   = (blockIdx.x + 1) * BLOCK * SIGMA;
-    int start(0), end(0), coord_y(0);
-    merge_search<SIGMA>(offset, nrow, nnz, diag_start, start, coord_y);
-    merge_search<SIGMA>(offset, nrow, nnz, diag_end, end, coord_y);
-    int items_num = end - start;
-    int data[SIGMA] = {0};
-    int head[SIGMA] = {0};
-
-    //定义类型
-    using BlockLoad = cub::BlockLoad<int, BLOCK, SIGMA, cub::BLOCK_LOAD_TRANSPOSE>;
-    using BlockSort = cub::BlockRadixSort<int, BLOCK, SIGMA>;
-    using BlockDisc = cub::BlockDiscontinuity<int, BLOCK>;
-    using BlockReduce = cub::BlockReduce<int, BLOCK>;
-    
-    using BlockLoadStorage   = typename BlockLoad::TempStorage;
-    using BlockSortStorage   = typename BlockSort::TempStorage;
-    using BlockDiscStorage   = typename BlockDisc::TempStorage;
-    using BlockReduceStorage = typename BlockReduce::TempStorage;
-
-    //申请共享内存
-    __shared__ alignas(16) union
-    {
-        BlockLoadStorage   load;
-        BlockSortStorage   sort;
-        BlockDiscStorage   disc;
-        BlockReduceStorage reduce;
-    } smem;
-    
-    //setp 1：加载数据
-    BlockLoad(smem.load).Load(&indice[start], data, items_num, INT_MAX);
-    __syncthreads();
-
-    //step 2：计算
-    #pragma unroll
-    for(int idx=0; idx<SIGMA; ++idx)
-    {
-        data[idx] = (threadIdx.x * SIGMA + idx < items_num)? data[idx] / 8 : data[idx];
-    }
-    __syncthreads();
-
-    //step 2：排序
-    BlockSort(smem.sort).Sort(data);
-    __syncthreads();
-
-    //step 3：作差
-    BlockDisc(smem.disc).FlagHeads(head, data, cub::Inequality());
-    __syncthreads();
-
-    //step 4：求和
-    int local = 0;
-    #pragma unroll
-    for (int idx=0; idx<SIGMA; ++idx) 
-    {
-        local += (threadIdx.x * SIGMA + idx < items_num)? head[idx] : 0;
-    }
-    __syncthreads();
-
-    int count = BlockReduce(smem.reduce).Sum(local);
-    __syncthreads();
-
-    if(threadIdx.x == 0)
-    {
-        d_count[blockIdx.x] = count;
-        d_items[blockIdx.x] = items_num;
-    }
-}
-
-
-template<unsigned int BLOCK, unsigned int SIGMA>
-void score(const int* __restrict__  offset,
-           const int* __restrict__  indice,
-           const int                nrow,
-           const int                nnz,
-           float&                   rel)
-{
-    //step 1：变量赋值
-    const int lane_num = (nnz + nrow + SIGMA - 1)/ SIGMA;
-    const int grid = (lane_num + BLOCK - 1) / BLOCK;
-    int*  d_count;
-    int*  d_items;
-    cudaMalloc((void**)&d_count, sizeof(int) * grid);
-    cudaMalloc((void**)&d_items, sizeof(int) * grid);
-    thrust::device_ptr<int>  ptr_count(d_count);
-    thrust::device_ptr<int>  ptr_items(d_items);
-
-    //step 2：计算warp的workset
-    score_kernel<BLOCK, SIGMA><<<grid, BLOCK>>>(offset, indice, nrow, nnz, d_count, d_items);
-
-    //step 3：统计结果
-    auto count = thrust::reduce(ptr_count, ptr_count + grid);
-    auto items = thrust::reduce(ptr_items, ptr_items + grid);
-    rel = (float)(count) / items;
-    
-    //step 4：回收空间
-    CUDAFREE(d_count);
-    CUDAFREE(d_items);
-}
-
-//大尺度reuse-distance
-struct Fenwick 
-{
-    int              n;
-    std::vector<int> bit;
-    explicit Fenwick(int n_) : n(n_), bit(n_ + 1, 0) {};
-    inline void add(int idx, int delta) 
-    {
-        for (int i = idx + 1; i <= n; i += i & -i) bit[i] += delta;
-    };
-    inline long long sum(int idx) const 
-    {
-        long long s = 0;
-        for (int i = idx + 1; i > 0; i -= i & -i) s += bit[i];
-        return s;
-    };
-    inline long long range_sum(int l, int r) const 
-    {
-        if (r < l) return 0;
-        if (l <= 0) return sum(r);
-        return sum(r) - sum(l - 1);
-    }
-};
-
-void compute_sector_rd_histogram(const int*                    col_ind,
-                                 const int                     nrow,
-                                 int                           nnz,
-                                 int                           sector_size,
-                                 const std::vector<int>&       bin_edges,
-                                 std::vector<double>&          bin_prob_out)
-{
-    //step 1: 计算 sector 范围
-    int num_sectors = (nrow + sector_size - 1) / sector_size;
-    std::vector<int> last_pos(num_sectors, -1);
-    Fenwick bit(nnz);
-
-    const int num_bins = int(bin_edges.size()) + 1;
-    std::vector<int> bin_counts(num_bins, 0);
-
-    int cnt_rd = 0;  // 有重用的访问数
-
-    for (int k = 0; k < nnz; ++k) 
-    {
-        int s = int(col_ind[k] / sector_size);
-
-        int old = last_pos[s];
-        if (old == -1) 
-        {
-            // first time
-            bit.add(k, 1);
-            last_pos[s] = k;
-        } 
-        else 
-        {
-            // remove old
-            bit.add(old, -1);
-            long long rd = bit.range_sum(old + 1, k - 1);
-
-            // 归入某个 bin
-            int bin_id = 0;
-            // 找到第一个 bin_edges[bin_id] > rd 的位置
-            while (bin_id < (int)bin_edges.size() && rd >= bin_edges[bin_id]) 
-            {
-                ++bin_id;
-            }
-            // bin_id in [0..num_bins-1]
-            ++bin_counts[bin_id];
-            ++cnt_rd;
-
-            // update new last_pos
-            bit.add(k, 1);
-            last_pos[s] = k;
-        }
-    }
-
-    bin_prob_out.resize(num_bins, 0.0);
-
-    for (int i = 0; i < num_bins; ++i) 
-    {
-        bin_prob_out[i] = double(bin_counts[i]) / double(cnt_rd);  // 0..1
-    }
 }
 
 template<typename ValueType>
 void GRAPH<ValueType>::locality_predict(const ENV& _env, float& speedup)
 {
-    //step 1：生成col_ind
-    sort(false);
-    int* tmp_row_ind = (int*)malloc(sizeof(int) * nnz);
-    cudaMemcpy(tmp_row_ind, row_ind, sizeof(int) * nnz, cudaMemcpyDeviceToHost);
+    constexpr int sector_size = 32;
+    const std::vector<int> bin_edges = {1, 112, 512, 18432, 36864, 73728, 147456, 294912, 589824};
+    std::array<double, rd_merbit_model::kFeatureCount> rd_feature{};
+    float  tim1(0.0), tim2(0.0);
 
-    //step 2：计算reuse distance
-    const int sector_size = 32;
-    std::vector<int>    bin_edges = {1, 112, 512, 18432, 36864, 73728, 147456, 294912, 589824};
-    std::vector<double> bin_prob(bin_edges.size() + 1, 0.0);
-    compute_sector_rd_histogram(tmp_row_ind, nrow, nnz, sector_size, bin_edges, bin_prob);
-    //step 3：预测
-    for (auto& prob : bin_prob)
+    // Recommended comparison settings. max_scan=0 is required to avoid an
+    // unresolved-tail bias relative to the exact histogram.
+    const int samples = 30960;
+    const int rd_cap = bin_edges.back();
+    const int hll_p = 12;
+    const int max_scan = 0;
+    const int stream_type = 0;
+
+    Timer timer;
+
+    // Build the access stream once. It is common to exact and sampled RD, so
+    // report it separately rather than charging it only to exact RD.
+    timer.Start();
+    if (false)
     {
-        FSTR << "&" << prob;
-    }
-    //FSTR << "&" << gscore(_env, 5);
+        // Exact RD: D2H copy + CPU histogram.
+        std::vector<double> exact_prob(bin_edges.size() + 1, 0.0);
+        {
+            std::vector<int> h_stream(nnz);
+            cudaMemcpy(h_stream.data(), row_ind, sizeof(int) * nnz, cudaMemcpyDeviceToHost);
+            compute_sector_rd_histogram(h_stream.data(), nrow, nnz, sector_size, bin_edges, exact_prob);
+        }
 
-    //step 4：回收空间
-    FREE(tmp_row_ind);
+        for (size_t i = 0; i < rd_feature.size(); ++i)
+        {
+            rd_feature[i] = exact_prob[i];
+        }
+    }
+    
+
+    if (true)
+    {
+        // Sampled RD: GPU sampling + D2H result copy + host bin aggregation.
+        std::vector<double> sampled_prob(bin_edges.size() + 1, 0.0);
+        sampled_hll_rd_block_gpu(_env, graph_id, row_ind, nnz, samples, sector_size, rd_cap, hll_p, max_scan, stream_type, bin_edges, sampled_prob);
+        
+        for (size_t i = 0; i < rd_feature.size(); ++i)
+        {
+            rd_feature[i] = sampled_prob[i];
+        }
+    }
+    timer.Stop();
+    tim1 = timer.Millisecs();
+
+    timer.Start();
+    const double predicted_speedup = rd_merbit_model::PredictSpeedup(rd_feature);
+    if (!std::isfinite(predicted_speedup) || predicted_speedup <= 0.0)
+    {
+        throw std::runtime_error("Predictor returned an invalid speedup");
+    }
+    speedup = static_cast<float>(predicted_speedup);
+    timer.Stop();
+    tim2 = timer.Millisecs();
+
+    FSTR << "&" << tim1 << "&" << tim2 << "&" << speedup;
 }
 
 /*
@@ -3397,12 +3060,9 @@ void GRAPH<ValueType>::gorder6(const ENV&  _env,
 
     //step 3：复制到CPU
     cudaMemcpy(h_permutation, d_permutation, sizeof(unsigned int) * nrow, cudaMemcpyDeviceToHost);
-    timer.Stop();
-    tim1 = timer.Millisecs();
 
     //step 4：CPU排序部分
     //统一生成NODE
-    timer.Start();
     std::vector<std::unique_ptr<Node>>    NODE(nrow);
     #pragma omp parallel for
     for(int i=0; i<nrow; ++i)
@@ -3434,9 +3094,10 @@ void GRAPH<ValueType>::gorder6(const ENV&  _env,
     
     cudaMemcpy(d_permutation, h_permutation, sizeof(unsigned int) * nrow, cudaMemcpyHostToDevice);
     timer.Stop();
-    tim2 = timer.Millisecs();
+    tim1 = timer.Millisecs();
 
     //step 6：创建新的列索引映射
+    timer.Start();
     thrust::device_ptr<int> ptr_perm(perm);
     thrust::scatter(thrust::make_counting_iterator(0), thrust::make_counting_iterator(nrow), ptr_permutation, ptr_perm);
     cudaDeviceSynchronize();
@@ -3454,8 +3115,11 @@ void GRAPH<ValueType>::gorder6(const ENV&  _env,
     thrust::gather(ptr_col, ptr_col + nnz, ptr_perm, ptr_col);
     sort(false);
     cudaDeviceSynchronize();
+    timer.Stop();
+    tim2 = timer.Millisecs();
     
-    FSTR << "&gorder6&" << _width << "&" << tim1 << "&" << tim2;
+    //FSTR << "&gorder6&" << _width << "&" << tim1 << "&" << tim2;
+    FSTR << "&" << tim1 << "&" << tim2;
     
     //step 8：回收内存
     CUDAFREE(d_key_in);
